@@ -1,0 +1,1510 @@
+From 117a2c1541ab8d2561ebdcc8692607afe854ee2a Mon Sep 17 00:00:00 2001
+From: "James, Wu" <jiangmwu@amd.com>
+Date: Fri, 8 May 2026 12:07:22 +0000
+Subject: [PATCH 2/2] enable triton fp16 and fp8 from atom
+
+VLLM_DSV4_USE_AITER_TRITON_MLA_PREFILL
+VLLM_DSV4_USE_AITER_TRITON_MLA_DECODE
+VLLM_DSV4_USE_ATOM_TRITON_PREFILL_FP8
+VLLM_DSV4_USE_ATOM_TRITON_DECODE_FP8
+VLLM_DSV4_USE_ATOM_TRITON_PREFILL
+VLLM_DSV4_USE_ATOM_TRITON_DECODE
+---
+ .../layers/deepseek_v4_attention.py           |  398 ++++++-
+ .../attention/ops/atom_sparse_attn_paged.py   | 1034 +++++++++++++++++
+ 2 files changed, 1425 insertions(+), 7 deletions(-)
+ create mode 100644 vllm/v1/attention/ops/atom_sparse_attn_paged.py
+
+diff --git a/vllm/model_executor/layers/deepseek_v4_attention.py b/vllm/model_executor/layers/deepseek_v4_attention.py
+index ec90d369e..d1304aead 100644
+--- a/vllm/model_executor/layers/deepseek_v4_attention.py
++++ b/vllm/model_executor/layers/deepseek_v4_attention.py
+@@ -1054,18 +1054,26 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+         M = N + self.window_size + self.max_num_batched_tokens
+         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+ 
+-        # FP8-direct prefill (ROCm + aiter Triton): allocate a raw-bytes workspace
+-        # mirroring the V4 cache slot layout (448 fp8 + 128 bf16 + 8 e8m0 = 584
+-        # bytes per slot) and skip the bf16 dequant gather. The kernel dequants
+-        # in the MFMA prologue. Otherwise, fall back to the bf16 dequant gather.
++        # FP8-direct prefill (ROCm + aiter or atom Triton): allocate a
++        # raw-bytes workspace mirroring the V4 cache slot layout (448 fp8 +
++        # 128 bf16 + 8 e8m0 = 584 bytes per slot) and skip the bf16 dequant
++        # gather. The kernel dequants in the MFMA prologue. Otherwise fall
++        # back to the bf16 dequant gather.
+         use_aiter_fp8 = (
+             current_platform.is_rocm()
+             and os.environ.get("VLLM_DSV4_USE_AITER_TRITON_MLA_PREFILL", "0") == "1"
+         )
++        use_atom_fp8 = (
++            current_platform.is_rocm()
++            and os.environ.get("VLLM_DSV4_USE_ATOM_TRITON_PREFILL_FP8", "0") == "1"
++        )
++        # Both FP8-direct backends share the same FP8 workspace + raw
++        # gather; they only differ in which kernel consumes it.
++        need_fp8_workspace = use_aiter_fp8 or use_atom_fp8
+ 
+         SLOT_BYTES = self.nope_head_dim + 2 * self.rope_head_dim + 8  # = 584 for V4
+         workspace_manager = current_workspace_manager()
+-        if use_aiter_fp8:
++        if need_fp8_workspace:
+             kv_raw = workspace_manager.get_simultaneous(
+                 ((PREFILL_CHUNK_SIZE, M, SLOT_BYTES), torch.uint8),
+             )[0]
+@@ -1089,7 +1097,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+                     # Gather compressed KV
+                     assert attn_metadata is not None
+                     block_table = attn_metadata.block_table[num_decodes:]
+-                    if use_aiter_fp8:
++                    if need_fp8_workspace:
+                         gather_raw_k_cache(
+                             kv_raw[:chunk_size],
+                             compressed_k_cache,
+@@ -1112,7 +1120,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+ 
+                 # Gather SWA KV
+                 swa_block_table = swa_metadata.block_table[num_decodes:]
+-                if use_aiter_fp8:
++                if need_fp8_workspace:
+                     gather_raw_k_cache(
+                         kv_raw[:chunk_size],
+                         swa_k_cache,
+@@ -1171,6 +1179,35 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+                             combined_indices=combined_indices,
+                             out=output[query_start:query_end],
+                         )
++                    elif use_atom_fp8:
++                        # ATOM FP8-direct prefill: same FP8 raw workspace
++                        # as AITER's path, different kernel consumes it.
++                        self._atom_sparse_attn_prefill_chunk_fp8(
++                            q=q[query_start:query_end],
++                            kv_raw=kv_raw,
++                            chunk_size=chunk_size,
++                            combined_indices=combined_indices,
++                            out=output[query_start:query_end],
++                        )
++                    elif (
++                        os.environ.get("VLLM_DSV4_USE_ATOM_TRITON_PREFILL", "0") == "1"
++                    ):
++                        # ATOM-style ragged-paged Triton prefill kernel.
++                        # Reuses vLLM's BF16 gather workspace (`kv`) so the
++                        # comparison vs `_ref_sparse_attn_prefill` is
++                        # apples-to-apples; vs the AITER FP8-direct path
++                        # it pays an extra dequant gather (already done by
++                        # `dequantize_and_gather_k_cache` above). Pass the
++                        # FULL `kv` buffer (not `kv[:chunk_size]`) so the
++                        # flat-slot space matches the reference's
++                        # `kv.view(-1, 1, d)` indexing.
++                        self._atom_sparse_attn_prefill_chunk(
++                            q=q[query_start:query_end],
++                            kv=kv,
++                            combined_indices=combined_indices,
++                            combined_lens=combined_lens,
++                            out=output[query_start:query_end],
++                        )
+                     else:
+                         output_chunk = self._ref_sparse_attn_prefill(
+                             q=q[query_start:query_end],
+@@ -1243,6 +1280,44 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+         from vllm.v1.attention.ops.dsv4_perf_probe import probe as _dsv4_probe
+         use_gluon = os.environ.get("VLLM_DSV4_USE_AITER_GLUON_MLA_DECODE", "0") == "1"
+         use_triton = os.environ.get("VLLM_DSV4_USE_AITER_TRITON_MLA_DECODE", "0") == "1"
++        use_atom = os.environ.get("VLLM_DSV4_USE_ATOM_TRITON_DECODE", "0") == "1"
++        use_atom_fp8 = os.environ.get("VLLM_DSV4_USE_ATOM_TRITON_DECODE_FP8", "0") == "1"
++        if use_atom_fp8:
++            # ATOM kernel reading FP8 nope + e8m0 scales + BF16 rope
++            # directly from the V4 cache — eliminates the host-side
++            # fp8->bf16 dequant pass that the BF16 ATOM path pays.
++            # Apples-to-apples vs AITER's `_aiter_sparse_attn_decode_fp8`.
++            with _dsv4_probe("mla.decode"):
++                self._atom_sparse_attn_decode_fp8(
++                    q=q,
++                    quant_swa_cache=self.swa_cache_layer.kv_cache,
++                    swa_indices=swa_indices,
++                    quant_extra_cache=None if swa_only else kv_cache,
++                    topk_indices=topk_indices,
++                    attn_sink=self.attn_sink[: q.shape[1]],
++                    out=output,
++                )
++            return
++        if use_atom:
++            # ATOM-style ragged-paged Triton decode kernel. Single-launch
++            # SWA + compressed via two-source kernel, attn_sink fused into
++            # the in-kernel finalization. Inputs are BF16 dequantized
++            # pools (host-side fp8->bf16 same as the gluon / ref paths) so
++            # the comparison vs them is apples-to-apples; vs the AITER
++            # FP8-direct path it pays an extra dequant pass.
++            with _dsv4_probe("mla.decode"):
++                blocked_swa = self._dequantize_blocked_k_cache(self.swa_cache_layer.kv_cache)
++                blocked_extra = None if swa_only else self._dequantize_blocked_k_cache(kv_cache)
++                self._atom_sparse_attn_decode(
++                    q=q,
++                    blocked_swa=blocked_swa,
++                    swa_indices=swa_indices,
++                    blocked_extra=blocked_extra,
++                    topk_indices=topk_indices,
++                    attn_sink=self.attn_sink[: q.shape[1]],
++                    out=output,
++                )
++            return
+         if use_triton:
+             # FP8-direct: kernel reads raw quantized cache and dequantizes inside
+             # the MFMA prologue. Skips the host-side `_dequantize_blocked_k_cache`
+@@ -1853,6 +1928,315 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+         if aiter_out is not out:
+             out.copy_(aiter_out.to(out.dtype))
+ 
++    def _atom_sparse_attn_decode(
++        self,
++        q: torch.Tensor,                         # [b, h, d] BF16
++        blocked_swa: torch.Tensor,               # [num_swa_blocks, swa_block_size, 1, d] BF16
++        swa_indices: torch.Tensor,               # [b, 1, swa_topk] int32 (-1 padded)
++        blocked_extra: torch.Tensor | None,      # [num_c_blocks, c_block_size, 1, d] BF16 or None
++        topk_indices: torch.Tensor | None,       # [b, 1, c_topk] int32 (-1 padded) or None
++        attn_sink: torch.Tensor,                 # [h] FP32
++        out: torch.Tensor,                       # [b, h, d_v] write target (BF16)
++    ) -> None:
++        """ATOM-style decode path: ragged-paged sparse attention written
++        directly in Triton (`atom_sparse_attn_paged_*_triton`).
++
++        Differences vs the AITER `unified_attention_sparse_mla` path:
++          - Single launch covers SWA + compressed via ATOM's two-source
++            kernel (no externally-merged LSE).
++          - attn_sink is finalized inside the kernel as a third virtual
++            logsumexp term — bit-equivalent to `two_pool_lse_merge`.
++          - Inputs must be already-dequantized BF16 pools; we reuse vLLM's
++            `_dequantize_blocked_k_cache` upstream so the comparison vs
++            `_ref_sparse_attn_decode` / gluon is apples-to-apples.
++        """
++        from vllm.v1.attention.ops.atom_sparse_attn_paged import (
++            atom_sparse_attn_paged_decode_triton,
++            atom_sparse_attn_paged_prefill_triton,
++        )
++
++        b, h, d = q.shape
++
++        # Flatten SWA pool to [num_swa_pages, d].
++        swa_flat = blocked_swa.reshape(-1, d)
++        # `swa_indices` arrives as [b, 1, swa_topk] (-1 padded). The kernel
++        # consumes ragged slot lists with a constant per-row stride; -1
++        # entries are skipped in-kernel. Build a true prefix sum that
++        # walks `swa_topk` slots per row.
++        swa_idx_flat = swa_indices.reshape(b, -1).contiguous()
++        swa_topk = swa_idx_flat.shape[1]
++        kv_indptr_swa = torch.arange(
++            0, b + 1, device=q.device, dtype=torch.int32
++        ) * swa_topk
++
++        if blocked_extra is None:
++            # SWA-only layer: single-source kernel.
++            atom_sparse_attn_paged_decode_triton(
++                q=q,
++                unified_kv=swa_flat,
++                kv_indices=swa_idx_flat.view(-1),
++                kv_indptr=kv_indptr_swa,
++                attn_sink=attn_sink,
++                softmax_scale=self.scale,
++                out=out,
++            )
++            # Match _aiter_sparse_attn_decode: rows whose entire topk is -1
++            # produce 0/0 -> NaN; clamp to 0 to mirror the ref's
++            # lonely_q_mask.
++            torch.nan_to_num_(out, nan=0.0, posinf=0.0, neginf=0.0)
++            return
++
++        # SWA + compressed: two-source kernel covers both pools in a single
++        # launch. ATOM's prefill kernel design was specifically built for
++        # this case (independent prefix + extend pools sharing one online
++        # softmax accumulator).
++        extra_flat = blocked_extra.reshape(-1, d)
++        extra_idx_flat = topk_indices.reshape(b, -1).contiguous()
++        c_topk = extra_idx_flat.shape[1]
++        kv_indptr_c = torch.arange(
++            0, b + 1, device=q.device, dtype=torch.int32
++        ) * c_topk
++
++        atom_sparse_attn_paged_prefill_triton(
++            q=q,
++            unified_kv=swa_flat,
++            kv_indices_prefix=swa_idx_flat.view(-1),
++            kv_indptr_prefix=kv_indptr_swa,
++            kv=extra_flat,
++            kv_indices_extend=extra_idx_flat.view(-1),
++            kv_indptr_extend=kv_indptr_c,
++            attn_sink=attn_sink,
++            softmax_scale=self.scale,
++            out=out,
++        )
++        torch.nan_to_num_(out, nan=0.0, posinf=0.0, neginf=0.0)
++
++    def _atom_sparse_attn_decode_fp8(
++        self,
++        q: torch.Tensor,                         # [b, h, d_full] BF16
++        quant_swa_cache: torch.Tensor,           # raw V4 storage [num_blocks, swa_block_size, head_bytes]
++        swa_indices: torch.Tensor,               # [b, 1, swa_topk] int32 (-1 padded)
++        quant_extra_cache: torch.Tensor | None,  # raw quant cache for compressed pool, or None
++        topk_indices: torch.Tensor | None,       # [b, 1, c_topk] int32 (-1 padded) or None
++        attn_sink: torch.Tensor,                 # [h] FP32
++        out: torch.Tensor,                       # [b, h, d_v] write target (BF16)
++    ) -> None:
++        """ATOM-style decode with FP8-direct cache reads. Eliminates the
++        host-side `_dequantize_blocked_k_cache` pass that the BF16 ATOM
++        adapter pays — the ported kernel ingests the same FP8/BF16/e8m0
++        triple that AITER's `unified_attention_sparse_mla` consumes, so
++        this is the apples-to-apples ATOM-vs-AITER decode comparison.
++        """
++        from vllm.v1.attention.ops.atom_sparse_attn_paged import (
++            atom_sparse_attn_paged_decode_fp8_triton,
++            atom_sparse_attn_paged_prefill_fp8_triton,
++        )
++
++        b, h, _ = q.shape
++
++        # Reuse the existing zero-copy split: returns 3D-with-extra-dim
++        # views; squeeze the size-1 head dim to land on `(outer, inner, d)`
++        # which the FP8 kernel expects.
++        kv_fp8_swa, k_bf16_swa, kv_scales_swa = self._split_quant_k_cache_views(
++            quant_swa_cache
++        )
++        kv_fp8_swa = kv_fp8_swa.squeeze(2)      # [num_blocks, swa_bs, d_nope]
++        k_bf16_swa = k_bf16_swa.squeeze(2)      # [num_blocks, swa_bs, d_rope]
++        # kv_scales is already 3D [num_blocks, swa_bs, num_tiles]
++
++        swa_idx_flat = swa_indices.reshape(b, -1).contiguous()
++        swa_topk = swa_idx_flat.shape[1]
++        kv_indptr_swa = torch.arange(
++            0, b + 1, device=q.device, dtype=torch.int32
++        ) * swa_topk
++
++        if quant_extra_cache is None:
++            # SWA-only layer: single-source FP8 kernel.
++            atom_sparse_attn_paged_decode_fp8_triton(
++                q=q,
++                kv_fp8=kv_fp8_swa,
++                kv_rope=k_bf16_swa,
++                kv_scales=kv_scales_swa,
++                kv_indices=swa_idx_flat.view(-1),
++                kv_indptr=kv_indptr_swa,
++                attn_sink=attn_sink,
++                softmax_scale=self.scale,
++                out=out,
++            )
++            torch.nan_to_num_(out, nan=0.0, posinf=0.0, neginf=0.0)
++            return
++
++        # SWA + compressed: two-source FP8 kernel covers both pools in one
++        # launch (no externally-merged LSE — sink fused inside).
++        kv_fp8_c, k_bf16_c, kv_scales_c = self._split_quant_k_cache_views(
++            quant_extra_cache
++        )
++        kv_fp8_c = kv_fp8_c.squeeze(2)
++        k_bf16_c = k_bf16_c.squeeze(2)
++
++        extra_idx_flat = topk_indices.reshape(b, -1).contiguous()
++        c_topk = extra_idx_flat.shape[1]
++        kv_indptr_c = torch.arange(
++            0, b + 1, device=q.device, dtype=torch.int32
++        ) * c_topk
++
++        atom_sparse_attn_paged_prefill_fp8_triton(
++            q=q,
++            p_fp8=kv_fp8_swa,
++            p_rope=k_bf16_swa,
++            p_scales=kv_scales_swa,
++            p_indices=swa_idx_flat.view(-1),
++            p_indptr=kv_indptr_swa,
++            e_fp8=kv_fp8_c,
++            e_rope=k_bf16_c,
++            e_scales=kv_scales_c,
++            e_indices=extra_idx_flat.view(-1),
++            e_indptr=kv_indptr_c,
++            attn_sink=attn_sink,
++            softmax_scale=self.scale,
++            out=out,
++        )
++        torch.nan_to_num_(out, nan=0.0, posinf=0.0, neginf=0.0)
++
++    def _atom_sparse_attn_prefill_chunk_fp8(
++        self,
++        q: torch.Tensor,                # [chunk_q_tokens, h, d_full] BF16
++        kv_raw: torch.Tensor,           # [PREFILL_CHUNK_SIZE, M, slot_bytes] uint8 raw workspace
++        chunk_size: int,
++        combined_indices: torch.Tensor, # [chunk_q_tokens, combined_topk] int32 (-1 padded)
++        out: torch.Tensor,              # [chunk_q_tokens, h, d_full] write target
++    ) -> None:
++        """ATOM-style prefill with FP8-direct workspace reads. Same FP8 raw
++        gather (`gather_raw_k_cache`) as AITER's prefill, then the ATOM
++        single-source FP8 kernel consumes the workspace directly.
++        """
++        from vllm.v1.attention.ops.atom_sparse_attn_paged import (
++            atom_sparse_attn_paged_decode_fp8_triton,
++        )
++
++        d_nope = self.nope_head_dim
++        d_rope = self.rope_head_dim
++        bf16_bytes = 2 * d_rope
++        slot_bytes = d_nope + bf16_bytes + 8
++
++        ps, M, sb = kv_raw.shape
++        assert sb == slot_bytes, f"raw workspace slot bytes={sb}, expected {slot_bytes}"
++
++        # Build the same FP8/rope/scales triple over the FP8 workspace as
++        # the AITER prefill path uses (slot stride = 584 bytes). Caller's
++        # combined_indices values are flat slot ids in [0, ps*M).
++        #
++        # IMPORTANT: regroup [ps, M, ...] into [ps*M/bs, bs, ...] with
++        # ``bs = 64`` so the kernel's ``INNER_SIZE`` constexpr is a power
++        # of two -- otherwise the per-iteration ``slot // INNER_SIZE`` /
++        # ``slot %  INNER_SIZE`` address decode pegs each lane on a slow
++        # software integer divide (M ~= N + window + max_num_batched is
++        # rarely power-of-two and dwarfs prefill latency on ROCm Triton).
++        # ``M`` is already 64-aligned upstream (AITER prefill asserts it).
++        bs = 64
++        assert (ps * M) % bs == 0, (
++            f"flat workspace slot count {ps * M} must be divisible by {bs}"
++        )
++        num_blocks = (ps * M) // bs
++
++        # Mirror AITER's prefill view -- reblock the contiguous [ps, M,
++        # slot_bytes] workspace into [num_blocks, bs, slot_bytes] via
++        # zero-copy ``.view`` (avoids any reshape-driven copies on the
++        # rope/scales sub-tensors).
++        kv_flat = kv_raw.view(ps * M, slot_bytes)
++        kv_paged_bytes = kv_flat.view(num_blocks, bs, slot_bytes)
++
++        kv_fp8 = (
++            kv_paged_bytes[..., :d_nope].view(current_platform.fp8_dtype())
++        )
++        kv_rope = (
++            kv_paged_bytes[..., d_nope:d_nope + bf16_bytes]
++            .reshape(num_blocks, bs, bf16_bytes)
++            .view(torch.bfloat16)
++        )
++        kv_scales = kv_paged_bytes[..., d_nope + bf16_bytes:][:, :, : d_nope // 64]
++
++        T = q.shape[0]
++        idx_flat = combined_indices.to(torch.int32).contiguous()
++        # The dense indptr stride is the per-token slot count produced by
++        # `combine_topk_swa_indices` (= topk + window padded to alignment),
++        # NOT the workspace inner dim `M`. `combined_indices` is shaped
++        # ``[T, combined_topk]`` with -1 sentinels in the per-token tail;
++        # using `M` here would read kv_indices past its end and trip a
++        # hipErrorIllegalAddress.
++        idx_stride = idx_flat.shape[1]
++        kv_indptr = torch.arange(
++            0, T + 1, device=q.device, dtype=torch.int32
++        ) * idx_stride
++
++        atom_sparse_attn_paged_decode_fp8_triton(
++            q=q,
++            kv_fp8=kv_fp8,
++            kv_rope=kv_rope,
++            kv_scales=kv_scales,
++            kv_indices=idx_flat.view(-1),
++            kv_indptr=kv_indptr,
++            attn_sink=self.attn_sink[: q.shape[1]],
++            softmax_scale=self.scale,
++            out=out,
++        )
++        torch.nan_to_num_(out, nan=0.0, posinf=0.0, neginf=0.0)
++        # `chunk_size` is intentionally unused (kv_raw view encompasses the
++        # whole workspace; combined_indices' slot ids stay within the
++        # active region).
++        del chunk_size
++
++    def _atom_sparse_attn_prefill_chunk(
++        self,
++        q: torch.Tensor,                # [chunk_q_tokens, h, d] BF16
++        kv: torch.Tensor,               # [chunk_size, M, d] BF16 (already gathered)
++        combined_indices: torch.Tensor, # [chunk_q_tokens, M] int32 (-1 padded)
++        combined_lens: torch.Tensor,    # [chunk_q_tokens] int32 (true valid prefix)
++        out: torch.Tensor,              # [chunk_q_tokens, h, d] write target
++    ) -> None:
++        """ATOM-style prefill path: single-source ragged sparse attention.
++
++        vLLM has already gathered SWA + compressed into one flat BF16 buffer
++        (`kv`), so we use ATOM's single-source (decode) kernel here. The
++        kernel walks `combined_lens[t]` real slots per query token; the
++        rest of the dense `M` strip up to `BLOCK_K` granularity is masked.
++        """
++        from vllm.v1.attention.ops.atom_sparse_attn_paged import (
++            atom_sparse_attn_paged_decode_triton,
++        )
++
++        T = q.shape[0]
++        # `kv` is [chunk_size, M, d]; flatten to [chunk_size * M, d].
++        kv_flat = kv.reshape(-1, kv.shape[-1])
++
++        # `combined_indices` values are absolute slot ids in the
++        # `[chunk_size * M]` flat pool (built upstream by
++        # `combine_topk_swa_indices`). Use a constant-stride indptr
++        # (`arange(T+1) * M`) so the kernel walks the dense [T, M] tile
++        # row by row, skipping -1 sentinels in the per-token tail. This
++        # keeps shapes static (CUDAGraph-friendly).
++        idx_flat = combined_indices.to(torch.int32).contiguous()
++        M = idx_flat.shape[1]
++        kv_indptr = torch.arange(
++            0, T + 1, device=q.device, dtype=torch.int32
++        ) * M
++
++        atom_sparse_attn_paged_decode_triton(
++            q=q,
++            unified_kv=kv_flat,
++            kv_indices=idx_flat.view(-1),
++            kv_indptr=kv_indptr,
++            attn_sink=self.attn_sink[: q.shape[1]],
++            softmax_scale=self.scale,
++            out=out,
++        )
++        torch.nan_to_num_(out, nan=0.0, posinf=0.0, neginf=0.0)
++        # `combined_lens` is intentionally unused: -1 sentinels in the
++        # dense tail of `combined_indices` already encode the per-token
++        # tail truncation, and using the dense indptr is required for
++        # CUDAGraph capture (kernel trip count is constexpr-friendly).
++        del combined_lens
++
+     def _aiter_sparse_attn_prefill_chunk_fp8(
+         self,
+         q: torch.Tensor,                # [chunk_tokens, h, d=512] BF16
+diff --git a/vllm/v1/attention/ops/atom_sparse_attn_paged.py b/vllm/v1/attention/ops/atom_sparse_attn_paged.py
+new file mode 100644
+index 000000000..17d33eb10
+--- /dev/null
++++ b/vllm/v1/attention/ops/atom_sparse_attn_paged.py
+@@ -0,0 +1,1034 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""ATOM-style sparse attention Triton kernels for DeepSeek V4 MLA.
++
++Ported from `atom/model_ops/v4_kernels/{paged_decode,paged_prefill}.py`
++in the ATOM project, plus FP8-direct variants written specifically for
++vLLM's `fp8_ds_mla` cache layout.
++
++BF16 variants (mirror ATOM's native API):
++
++* `atom_sparse_attn_paged_decode_triton`: single-source online-softmax
++  attention. Reads from ONE flat BF16 KV pool indexed by per-query ragged
++  slot lists (with -1 sentinels). Used for vLLM's prefill chunk path
++  (where SWA + extra are already gathered into one buffer).
++
++* `atom_sparse_attn_paged_prefill_triton`: two-source online-softmax
++  attention. Reads from TWO flat BF16 KV pools with separate per-query
++  ragged slot lists. The two regions share the same online-softmax
++  accumulator; order is irrelevant.
++
++FP8-direct variants (vLLM-only — the FP8 + e8m0 scale layout is
++ROCm/MI300X specific; ATOM upstream stays BF16):
++
++* `atom_sparse_attn_paged_decode_fp8_triton`: single-source FP8.
++  Loads FP8 nope tiles + per-tile e8m0 scales + BF16 rope from a
++  3D-organized cache view, dequantizes inside the K-load prologue,
++  and proceeds with the same online softmax + sink finalization.
++
++* `atom_sparse_attn_paged_prefill_fp8_triton`: two-source FP8 with
++  the same dequant-in-prologue trick on both sources.
++
++The 3D cache view fits both vLLM layouts (`outer, inner, d`):
++
++  * Decode `kv_cache`: outer=num_blocks, inner=block_size; per-block
++    storage is `[bs * 576 nope_rope][bs * 8 scales]` so fp8 slot stride
++    is 576, scales slot stride is 8, block strides are `bs * 584`.
++  * Prefill workspace: outer=ps (chunk slots), inner=M (slot pool);
++    per-slot storage is `[448 fp8 | 128 bf16 rope | 8 scales] = 584`
++    contiguous bytes. Slot stride 584 for fp8/scales, 292 (bf16
++    elements) for rope.
++
++The kernel takes the strides as constexpr params and handles both via
++``slot_id = outer_idx * INNER_SIZE + slot_in_inner``. Caller (the
++`DeepseekV4MLAAttention._atom_sparse_attn_*_fp8` adapters) computes
++the strides directly from the existing `_split_quant_k_cache_views`
++output — no host-side compaction or copy.
++
++All kernels apply per-head softmax-sink finalization (DeepSeek V4
++attn_sink contributes to the denominator only, V_sink == 0).
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _atom_sparse_attn_paged_decode_kernel(
++    q_ptr,                # [N, H, D]
++    unified_kv_ptr,       # [total_pages, D]
++    kv_indices_ptr,       # [total_indices] int32 (-1 sentinel skipped)
++    kv_indptr_ptr,        # [N+1] int32 (true prefix sum)
++    attn_sink_ptr,        # [H]
++    out_ptr,              # [N, H, D]
++    q_stride_t: tl.constexpr,
++    q_stride_h: tl.constexpr,
++    q_stride_d: tl.constexpr,
++    kv_stride_n: tl.constexpr,
++    kv_stride_d: tl.constexpr,
++    out_stride_t: tl.constexpr,
++    out_stride_h: tl.constexpr,
++    out_stride_d: tl.constexpr,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    softmax_scale: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++
++    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
++    d_offs = tl.arange(0, BLOCK_D)
++    h_mask = h_offs < H
++    d_mask = d_offs < D
++
++    q = tl.load(
++        q_ptr
++        + t * q_stride_t
++        + h_offs[:, None] * q_stride_h
++        + d_offs[None, :] * q_stride_d,
++        mask=h_mask[:, None] & d_mask[None, :],
++        other=0.0,
++    )
++    kv_start = tl.load(kv_indptr_ptr + t)
++    kv_end = tl.load(kv_indptr_ptr + t + 1)
++    kv_len = kv_end - kv_start
++
++    neg_large = -3.4028234663852886e38
++    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
++    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
++    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
++
++    k_offs = tl.arange(0, BLOCK_K)
++    for k_start in tl.range(0, kv_len, BLOCK_K):
++        k_pos = k_start + k_offs
++        in_range = k_pos < kv_len
++        slot = tl.load(
++            kv_indices_ptr + kv_start + k_pos,
++            mask=in_range,
++            other=-1,
++        )
++        valid = in_range & (slot >= 0)
++
++        kv = tl.load(
++            unified_kv_ptr
++            + slot[:, None] * kv_stride_n
++            + d_offs[None, :] * kv_stride_d,
++            mask=valid[:, None] & d_mask[None, :],
++            other=0.0,
++        )
++
++        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
++        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
++
++        m_block = tl.max(scores, axis=1)
++        m_new = tl.maximum(m_i, m_block)
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores - m_new[:, None])
++        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
++        l_new = l_i * alpha + tl.sum(p, axis=1)
++
++        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
++        m_i = m_new
++        l_i = l_new
++
++    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
++    m_final = tl.maximum(m_i, sink)
++    alpha = tl.exp(m_i - m_final)
++    l_final = l_i * alpha + tl.exp(sink - m_final)
++
++    denom = tl.maximum(l_final, 1.0e-30)
++    out = tl.where(l_final[:, None] > 0.0, (acc * alpha[:, None]) / denom[:, None], 0.0)
++    tl.store(
++        out_ptr
++        + t * out_stride_t
++        + h_offs[:, None] * out_stride_h
++        + d_offs[None, :] * out_stride_d,
++        out,
++        mask=h_mask[:, None] & d_mask[None, :],
++    )
++
++
++@triton.jit
++def _atom_sparse_attn_paged_prefill_kernel(
++    q_ptr,                  # [N, H, D]
++    unified_kv_ptr,         # [total_pages, D]   region-1 source
++    kv_indices_prefix_ptr,  # [total_prefix_indices] int32
++    kv_indptr_prefix_ptr,   # [N+1] int32
++    kv_ptr,                 # [total_tokens, D]   region-2 source
++    kv_indices_extend_ptr,  # [total_extend_indices] int32
++    kv_indptr_extend_ptr,   # [N+1] int32
++    attn_sink_ptr,          # [H]
++    out_ptr,                # [N, H, D]
++    q_stride_t: tl.constexpr,
++    q_stride_h: tl.constexpr,
++    q_stride_d: tl.constexpr,
++    pkv_stride_n: tl.constexpr,
++    pkv_stride_d: tl.constexpr,
++    ekv_stride_n: tl.constexpr,
++    ekv_stride_d: tl.constexpr,
++    out_stride_t: tl.constexpr,
++    out_stride_h: tl.constexpr,
++    out_stride_d: tl.constexpr,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    softmax_scale: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++
++    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
++    d_offs = tl.arange(0, BLOCK_D)
++    h_mask = h_offs < H
++    d_mask = d_offs < D
++
++    q = tl.load(
++        q_ptr
++        + t * q_stride_t
++        + h_offs[:, None] * q_stride_h
++        + d_offs[None, :] * q_stride_d,
++        mask=h_mask[:, None] & d_mask[None, :],
++        other=0.0,
++    )
++
++    neg_large = -3.4028234663852886e38
++    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
++    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
++    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
++
++    k_offs = tl.arange(0, BLOCK_K)
++
++    p_start = tl.load(kv_indptr_prefix_ptr + t)
++    p_end = tl.load(kv_indptr_prefix_ptr + t + 1)
++    p_len = p_end - p_start
++
++    for k_start in tl.range(0, p_len, BLOCK_K):
++        k_pos = k_start + k_offs
++        in_range = k_pos < p_len
++        slot = tl.load(
++            kv_indices_prefix_ptr + p_start + k_pos,
++            mask=in_range,
++            other=-1,
++        )
++        valid = in_range & (slot >= 0)
++
++        kv = tl.load(
++            unified_kv_ptr
++            + slot[:, None] * pkv_stride_n
++            + d_offs[None, :] * pkv_stride_d,
++            mask=valid[:, None] & d_mask[None, :],
++            other=0.0,
++        )
++
++        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
++        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
++
++        m_block = tl.max(scores, axis=1)
++        m_new = tl.maximum(m_i, m_block)
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores - m_new[:, None])
++        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
++        l_new = l_i * alpha + tl.sum(p, axis=1)
++
++        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
++        m_i = m_new
++        l_i = l_new
++
++    e_start = tl.load(kv_indptr_extend_ptr + t)
++    e_end = tl.load(kv_indptr_extend_ptr + t + 1)
++    e_len = e_end - e_start
++
++    for k_start in tl.range(0, e_len, BLOCK_K):
++        k_pos = k_start + k_offs
++        in_range = k_pos < e_len
++        slot = tl.load(
++            kv_indices_extend_ptr + e_start + k_pos,
++            mask=in_range,
++            other=-1,
++        )
++        valid = in_range & (slot >= 0)
++
++        kv = tl.load(
++            kv_ptr + slot[:, None] * ekv_stride_n + d_offs[None, :] * ekv_stride_d,
++            mask=valid[:, None] & d_mask[None, :],
++            other=0.0,
++        )
++
++        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
++        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
++
++        m_block = tl.max(scores, axis=1)
++        m_new = tl.maximum(m_i, m_block)
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores - m_new[:, None])
++        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
++        l_new = l_i * alpha + tl.sum(p, axis=1)
++
++        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
++        m_i = m_new
++        l_i = l_new
++
++    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
++    m_final = tl.maximum(m_i, sink)
++    alpha = tl.exp(m_i - m_final)
++    l_final = l_i * alpha + tl.exp(sink - m_final)
++
++    denom = tl.maximum(l_final, 1.0e-30)
++    out = tl.where(l_final[:, None] > 0.0, (acc * alpha[:, None]) / denom[:, None], 0.0)
++    tl.store(
++        out_ptr
++        + t * out_stride_t
++        + h_offs[:, None] * out_stride_h
++        + d_offs[None, :] * out_stride_d,
++        out,
++        mask=h_mask[:, None] & d_mask[None, :],
++    )
++
++
++def atom_sparse_attn_paged_decode_triton(
++    q: torch.Tensor,
++    unified_kv: torch.Tensor,
++    kv_indices: torch.Tensor,
++    kv_indptr: torch.Tensor,
++    attn_sink: torch.Tensor,
++    softmax_scale: float,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Single-source ragged sparse attention with attn-sink finalization.
++
++    Args:
++      q          : [N, H, D] BF16/FP16 — per-token query.
++      unified_kv : [total_pages, D] same dtype as q — flat BF16 KV pool.
++      kv_indices : [total_indices] int32 — flat slot lists; -1 entries are
++                   skipped (sentinel for unused tail).
++      kv_indptr  : [N+1] int32 — true prefix sum of per-query lengths.
++      attn_sink  : [H] FP32 — per-head softmax-denom bias.
++      softmax_scale: scalar float.
++      out        : optional [N, H, D] tensor (same dtype as q) to write into.
++                   When None, a fresh `torch.empty_like(q)` is allocated.
++    """
++    if not q.is_cuda:
++        raise RuntimeError("atom_sparse_attn_paged_decode requires CUDA/HIP tensors")
++    if q.dtype not in (torch.bfloat16, torch.float16):
++        raise RuntimeError(f"expects fp16/bf16 q, got {q.dtype}")
++    if unified_kv.dtype != q.dtype:
++        raise RuntimeError(
++            f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
++        )
++
++    T, H, D = q.shape
++    if out is None:
++        out = torch.empty_like(q)
++    kv_indices = kv_indices.to(torch.int32).contiguous()
++    kv_indptr = kv_indptr.to(torch.int32).contiguous()
++
++    block_h = 16
++    block_d = triton.next_power_of_2(D)
++    block_k = 16 if D >= 256 else 32
++
++    _atom_sparse_attn_paged_decode_kernel[(T, triton.cdiv(H, block_h))](
++        q,
++        unified_kv,
++        kv_indices,
++        kv_indptr,
++        attn_sink,
++        out,
++        q.stride(0),
++        q.stride(1),
++        q.stride(2),
++        unified_kv.stride(0),
++        unified_kv.stride(1),
++        out.stride(0),
++        out.stride(1),
++        out.stride(2),
++        H,
++        D,
++        float(softmax_scale),
++        BLOCK_H=block_h,
++        BLOCK_D=block_d,
++        BLOCK_K=block_k,
++        num_warps=8,
++    )
++    return out
++
++
++def atom_sparse_attn_paged_prefill_triton(
++    q: torch.Tensor,
++    unified_kv: torch.Tensor,
++    kv_indices_prefix: torch.Tensor,
++    kv_indptr_prefix: torch.Tensor,
++    kv: torch.Tensor,
++    kv_indices_extend: torch.Tensor,
++    kv_indptr_extend: torch.Tensor,
++    attn_sink: torch.Tensor,
++    softmax_scale: float,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Two-source ragged sparse attention.
++
++    Same online-softmax + attn-sink as the decode kernel; reads from two
++    independent BF16 KV pools (prefix and extend) in a single launch.
++    """
++    if not q.is_cuda:
++        raise RuntimeError("atom_sparse_attn_paged_prefill requires CUDA/HIP tensors")
++    if q.dtype not in (torch.bfloat16, torch.float16):
++        raise RuntimeError(f"expects fp16/bf16 q, got {q.dtype}")
++    if unified_kv.dtype != q.dtype or kv.dtype != q.dtype:
++        raise RuntimeError(
++            f"dtype mismatch: q={q.dtype}, unified_kv={unified_kv.dtype}, kv={kv.dtype}"
++        )
++    if unified_kv.size(-1) != kv.size(-1):
++        raise RuntimeError(
++            f"head_dim mismatch: unified_kv={unified_kv.size(-1)}, kv={kv.size(-1)}"
++        )
++
++    T, H, D = q.shape
++    if out is None:
++        out = torch.empty_like(q)
++    kv_indices_prefix = kv_indices_prefix.to(torch.int32).contiguous()
++    kv_indptr_prefix = kv_indptr_prefix.to(torch.int32).contiguous()
++    kv_indices_extend = kv_indices_extend.to(torch.int32).contiguous()
++    kv_indptr_extend = kv_indptr_extend.to(torch.int32).contiguous()
++
++    block_h = 16
++    block_d = triton.next_power_of_2(D)
++    block_k = 16 if D >= 256 else 32
++
++    _atom_sparse_attn_paged_prefill_kernel[(T, triton.cdiv(H, block_h))](
++        q,
++        unified_kv,
++        kv_indices_prefix,
++        kv_indptr_prefix,
++        kv,
++        kv_indices_extend,
++        kv_indptr_extend,
++        attn_sink,
++        out,
++        q.stride(0),
++        q.stride(1),
++        q.stride(2),
++        unified_kv.stride(0),
++        unified_kv.stride(1),
++        kv.stride(0),
++        kv.stride(1),
++        out.stride(0),
++        out.stride(1),
++        out.stride(2),
++        H,
++        D,
++        float(softmax_scale),
++        BLOCK_H=block_h,
++        BLOCK_D=block_d,
++        BLOCK_K=block_k,
++        num_warps=8,
++    )
++    return out
++
++
++# ============================================================================
++# FP8-direct kernels (vLLM-only, ROCm/MI300X)
++# ============================================================================
++#
++# Cache layout (per slot):
++#   bytes [0,    D_NOPE)           → FP8 nope     (D_NOPE elements, e.g. 448)
++#   bytes [D_NOPE, D_NOPE+2*D_ROPE) → BF16 rope   (D_ROPE elements, e.g. 64)
++#   bytes [..., +NUM_TILES_PADDED)  → e8m0 scales (NUM_TILES bytes, 1 per
++#                                                   D_NOPE/64 tile)
++#
++# Per-tile dequant: nope_bf16[t,...] = nope_fp8[t,...].to(bf16)
++#                                      * exp2(scale_byte[t] - 127).to(bf16)
++# We use the e8m0 → fp32 bitcast trick (`(byte << 23).bitcast<float>()`)
++# instead of `tl.exp2` to mirror vLLM's `_upcast_e8m0_to_fp32` semantics
++# exactly and to be one shift+reinterpret per element (no transcendental).
++#
++# Cache view passed to the kernel is 3D `(OUTER, INNER, D)` so the same
++# kernel handles both layouts:
++#   * Decode kv_cache: OUTER=num_blocks, INNER=block_size, with per-block
++#     [bs*576 nope_rope][bs*8 scales] storage → fp8 slot stride=576,
++#     scales slot stride=8, block strides=bs*584.
++#   * Prefill workspace `kv_raw`: OUTER=ps, INNER=M, slot-contiguous 584
++#     bytes per slot → fp8/scales slot stride=584, rope slot stride=292.
++# `slot_id = outer_idx * INNER_SIZE + inner_idx`; the kernel does the
++# divmod with INNER_SIZE as constexpr so power-of-two sizes get a free
++# shift+mask.
++
++
++@triton.jit
++def _atom_sparse_attn_paged_decode_fp8_kernel(
++    q_ptr,                      # [N, H, D_FULL] BF16
++    kv_fp8_ptr,                 # [OUTER, INNER, D_NOPE] FP8
++    kv_rope_ptr,                # [OUTER, INNER, D_ROPE] BF16
++    kv_scales_ptr,              # [OUTER, INNER, NUM_TILES] uint8 (e8m0 byte)
++    kv_indices_ptr,             # [total_indices] int32 (slot id, -1 sentinel)
++    kv_indptr_ptr,              # [N+1] int32
++    attn_sink_ptr,              # [H]
++    out_ptr,                    # [N, H, D_FULL] BF16
++    q_stride_t: tl.constexpr,
++    q_stride_h: tl.constexpr,
++    q_stride_d: tl.constexpr,
++    fp8_stride_outer: tl.constexpr,
++    fp8_stride_inner: tl.constexpr,
++    fp8_stride_d: tl.constexpr,
++    rope_stride_outer: tl.constexpr,
++    rope_stride_inner: tl.constexpr,
++    rope_stride_d: tl.constexpr,
++    scl_stride_outer: tl.constexpr,
++    scl_stride_inner: tl.constexpr,
++    scl_stride_t: tl.constexpr,
++    out_stride_t: tl.constexpr,
++    out_stride_h: tl.constexpr,
++    out_stride_d: tl.constexpr,
++    H: tl.constexpr,
++    D_NOPE: tl.constexpr,
++    D_ROPE: tl.constexpr,
++    BLOCK_D_NOPE: tl.constexpr,         # next_pow2(D_NOPE)
++    BLOCK_D_ROPE: tl.constexpr,         # next_pow2(D_ROPE)
++    NUM_TILES: tl.constexpr,
++    NUM_TILES_PADDED: tl.constexpr,     # next_pow2(NUM_TILES)
++    TILE_SIZE: tl.constexpr,
++    INNER_SIZE: tl.constexpr,
++    softmax_scale: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++
++    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
++    h_mask = h_offs < H
++    d_nope_offs = tl.arange(0, BLOCK_D_NOPE)
++    d_nope_mask = d_nope_offs < D_NOPE
++    d_rope_offs = tl.arange(0, BLOCK_D_ROPE)
++    d_rope_mask = d_rope_offs < D_ROPE
++
++    # Q is BF16 over the FULL head_dim (D_NOPE + D_ROPE); split into two
++    # tiles aligned to the K side's nope/rope split.
++    q_nope = tl.load(
++        q_ptr + t * q_stride_t
++        + h_offs[:, None] * q_stride_h
++        + d_nope_offs[None, :] * q_stride_d,
++        mask=h_mask[:, None] & d_nope_mask[None, :],
++        other=0.0,
++    )
++    q_rope = tl.load(
++        q_ptr + t * q_stride_t
++        + h_offs[:, None] * q_stride_h
++        + (D_NOPE + d_rope_offs[None, :]) * q_stride_d,
++        mask=h_mask[:, None] & d_rope_mask[None, :],
++        other=0.0,
++    )
++
++    kv_start = tl.load(kv_indptr_ptr + t)
++    kv_end = tl.load(kv_indptr_ptr + t + 1)
++    kv_len = kv_end - kv_start
++
++    neg_large = -3.4028234663852886e38
++    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
++    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
++    # Two accumulators so we don't need to materialize a full [BLOCK_K, D_FULL]
++    # K block. Both update by the same alpha each step.
++    acc_nope = tl.zeros((BLOCK_H, BLOCK_D_NOPE), dtype=tl.float32)
++    acc_rope = tl.zeros((BLOCK_H, BLOCK_D_ROPE), dtype=tl.float32)
++
++    k_offs = tl.arange(0, BLOCK_K)
++    # Per-element scale-byte index: each d in [0, D_NOPE) maps to tile
++    # `d // TILE_SIZE`. d_offs over the padded range up to BLOCK_D_NOPE may
++    # exceed NUM_TILES; the corresponding fp8 lanes are masked anyway.
++    scale_d_offs = d_nope_offs // TILE_SIZE
++
++    for k_start in tl.range(0, kv_len, BLOCK_K):
++        k_pos = k_start + k_offs
++        in_range = k_pos < kv_len
++        slot = tl.load(
++            kv_indices_ptr + kv_start + k_pos,
++            mask=in_range,
++            other=-1,
++        )
++        valid = in_range & (slot >= 0)
++        # Clamp invalid slots to 0 BEFORE the divmod / address math: masked
++        # Triton loads still compute the address, so a -1 sentinel would
++        # produce a negative byte offset and trip a HIP illegal-address
++        # fault on AMD even though the load is masked.
++        slot_safe = tl.where(valid, slot, 0)
++        outer_idx = slot_safe // INNER_SIZE
++        inner_idx = slot_safe - outer_idx * INNER_SIZE
++
++        # FP8 nope [BLOCK_K, BLOCK_D_NOPE]; padded d >= D_NOPE → 0.0.
++        kv_fp8 = tl.load(
++            kv_fp8_ptr
++            + outer_idx[:, None] * fp8_stride_outer
++            + inner_idx[:, None] * fp8_stride_inner
++            + d_nope_offs[None, :] * fp8_stride_d,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=0.0,
++        )
++
++        # Per-element e8m0 scale: load scale byte for the tile that owns
++        # each d position. L1 dedupes the 64 lanes touching the same byte
++        # so the nominal 64× redundant load is essentially free, and we
++        # avoid an FP8 `tl.reshape` that AMD Triton lowers slowly.
++        scale_byte = tl.load(
++            kv_scales_ptr
++            + outer_idx[:, None] * scl_stride_outer
++            + inner_idx[:, None] * scl_stride_inner
++            + scale_d_offs[None, :] * scl_stride_t,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=127,
++        ).to(tl.int32)
++        # e8m0 → fp32 via bitcast: byte is the fp32 exponent (mantissa 0)
++        # → 2^(byte - 127) ≡ bitcast<float>(byte << 23).
++        scale_fp32 = (scale_byte << 23).to(tl.float32, bitcast=True)
++
++        # Dequant in one shot — straight broadcast multiply, no reshape.
++        kv_nope = kv_fp8.to(tl.bfloat16) * scale_fp32.to(tl.bfloat16)
++
++        # BF16 rope tail (no per-tile scale).
++        kv_rope = tl.load(
++            kv_rope_ptr
++            + outer_idx[:, None] * rope_stride_outer
++            + inner_idx[:, None] * rope_stride_inner
++            + d_rope_offs[None, :] * rope_stride_d,
++            mask=valid[:, None] & d_rope_mask[None, :],
++            other=0.0,
++        )
++
++        # Split-D dot: q_nope · K_nope.T + q_rope · K_rope.T.
++        scores = tl.dot(q_nope, tl.trans(kv_nope))
++        scores += tl.dot(q_rope, tl.trans(kv_rope))
++        scores = scores * softmax_scale
++        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
++
++        m_block = tl.max(scores, axis=1)
++        m_new = tl.maximum(m_i, m_block)
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores - m_new[:, None])
++        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
++        l_new = l_i * alpha + tl.sum(p, axis=1)
++
++        # Two-buffer V accumulation (MLA: V == K, latent dim split into
++        # nope+rope so we keep the sub-buffers separate to avoid copying).
++        p_bf16 = p.to(tl.bfloat16)
++        acc_nope = acc_nope * alpha[:, None] + tl.dot(p_bf16, kv_nope)
++        acc_rope = acc_rope * alpha[:, None] + tl.dot(p_bf16, kv_rope)
++        m_i = m_new
++        l_i = l_new
++
++    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
++    m_final = tl.maximum(m_i, sink)
++    alpha = tl.exp(m_i - m_final)
++    l_final = l_i * alpha + tl.exp(sink - m_final)
++    denom = tl.maximum(l_final, 1.0e-30)
++
++    out_nope = tl.where(
++        l_final[:, None] > 0.0,
++        (acc_nope * alpha[:, None]) / denom[:, None],
++        0.0,
++    )
++    out_rope = tl.where(
++        l_final[:, None] > 0.0,
++        (acc_rope * alpha[:, None]) / denom[:, None],
++        0.0,
++    )
++    tl.store(
++        out_ptr + t * out_stride_t
++        + h_offs[:, None] * out_stride_h
++        + d_nope_offs[None, :] * out_stride_d,
++        out_nope,
++        mask=h_mask[:, None] & d_nope_mask[None, :],
++    )
++    tl.store(
++        out_ptr + t * out_stride_t
++        + h_offs[:, None] * out_stride_h
++        + (D_NOPE + d_rope_offs[None, :]) * out_stride_d,
++        out_rope,
++        mask=h_mask[:, None] & d_rope_mask[None, :],
++    )
++
++
++@triton.jit
++def _atom_sparse_attn_paged_prefill_fp8_kernel(
++    q_ptr,
++    # ---- region 1 (prefix): FP8 + e8m0 + BF16 rope ----
++    p_fp8_ptr, p_rope_ptr, p_scl_ptr,
++    p_idx_ptr, p_indptr_ptr,
++    # ---- region 2 (extend): same triple ----
++    e_fp8_ptr, e_rope_ptr, e_scl_ptr,
++    e_idx_ptr, e_indptr_ptr,
++    attn_sink_ptr,
++    out_ptr,
++    q_stride_t: tl.constexpr,
++    q_stride_h: tl.constexpr,
++    q_stride_d: tl.constexpr,
++    p_fp8_so: tl.constexpr,  p_fp8_si: tl.constexpr,  p_fp8_sd: tl.constexpr,
++    p_rope_so: tl.constexpr, p_rope_si: tl.constexpr, p_rope_sd: tl.constexpr,
++    p_scl_so: tl.constexpr,  p_scl_si: tl.constexpr,  p_scl_st: tl.constexpr,
++    e_fp8_so: tl.constexpr,  e_fp8_si: tl.constexpr,  e_fp8_sd: tl.constexpr,
++    e_rope_so: tl.constexpr, e_rope_si: tl.constexpr, e_rope_sd: tl.constexpr,
++    e_scl_so: tl.constexpr,  e_scl_si: tl.constexpr,  e_scl_st: tl.constexpr,
++    out_stride_t: tl.constexpr,
++    out_stride_h: tl.constexpr,
++    out_stride_d: tl.constexpr,
++    H: tl.constexpr,
++    D_NOPE: tl.constexpr,
++    D_ROPE: tl.constexpr,
++    BLOCK_D_NOPE: tl.constexpr,
++    BLOCK_D_ROPE: tl.constexpr,
++    NUM_TILES: tl.constexpr,
++    NUM_TILES_PADDED: tl.constexpr,
++    TILE_SIZE: tl.constexpr,
++    P_INNER_SIZE: tl.constexpr,
++    E_INNER_SIZE: tl.constexpr,
++    softmax_scale: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++
++    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
++    h_mask = h_offs < H
++    d_nope_offs = tl.arange(0, BLOCK_D_NOPE)
++    d_nope_mask = d_nope_offs < D_NOPE
++    d_rope_offs = tl.arange(0, BLOCK_D_ROPE)
++    d_rope_mask = d_rope_offs < D_ROPE
++
++    q_nope = tl.load(
++        q_ptr + t * q_stride_t
++        + h_offs[:, None] * q_stride_h
++        + d_nope_offs[None, :] * q_stride_d,
++        mask=h_mask[:, None] & d_nope_mask[None, :],
++        other=0.0,
++    )
++    q_rope = tl.load(
++        q_ptr + t * q_stride_t
++        + h_offs[:, None] * q_stride_h
++        + (D_NOPE + d_rope_offs[None, :]) * q_stride_d,
++        mask=h_mask[:, None] & d_rope_mask[None, :],
++        other=0.0,
++    )
++
++    neg_large = -3.4028234663852886e38
++    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
++    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
++    acc_nope = tl.zeros((BLOCK_H, BLOCK_D_NOPE), dtype=tl.float32)
++    acc_rope = tl.zeros((BLOCK_H, BLOCK_D_ROPE), dtype=tl.float32)
++
++    k_offs = tl.arange(0, BLOCK_K)
++    scale_d_offs = d_nope_offs // TILE_SIZE
++
++    # --- Region 1: prefix ---
++    p_start = tl.load(p_indptr_ptr + t)
++    p_end = tl.load(p_indptr_ptr + t + 1)
++    p_len = p_end - p_start
++
++    for k_start in tl.range(0, p_len, BLOCK_K):
++        k_pos = k_start + k_offs
++        in_range = k_pos < p_len
++        slot = tl.load(
++            p_idx_ptr + p_start + k_pos,
++            mask=in_range,
++            other=-1,
++        )
++        valid = in_range & (slot >= 0)
++        slot_safe = tl.where(valid, slot, 0)
++        outer_idx = slot_safe // P_INNER_SIZE
++        inner_idx = slot_safe - outer_idx * P_INNER_SIZE
++
++        kv_fp8 = tl.load(
++            p_fp8_ptr
++            + outer_idx[:, None] * p_fp8_so
++            + inner_idx[:, None] * p_fp8_si
++            + d_nope_offs[None, :] * p_fp8_sd,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=0.0,
++        )
++        scale_byte = tl.load(
++            p_scl_ptr
++            + outer_idx[:, None] * p_scl_so
++            + inner_idx[:, None] * p_scl_si
++            + scale_d_offs[None, :] * p_scl_st,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=127,
++        ).to(tl.int32)
++        scale_fp32 = (scale_byte << 23).to(tl.float32, bitcast=True)
++        kv_nope = kv_fp8.to(tl.bfloat16) * scale_fp32.to(tl.bfloat16)
++        kv_rope = tl.load(
++            p_rope_ptr
++            + outer_idx[:, None] * p_rope_so
++            + inner_idx[:, None] * p_rope_si
++            + d_rope_offs[None, :] * p_rope_sd,
++            mask=valid[:, None] & d_rope_mask[None, :],
++            other=0.0,
++        )
++
++        scores = tl.dot(q_nope, tl.trans(kv_nope))
++        scores += tl.dot(q_rope, tl.trans(kv_rope))
++        scores = scores * softmax_scale
++        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
++
++        m_block = tl.max(scores, axis=1)
++        m_new = tl.maximum(m_i, m_block)
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores - m_new[:, None])
++        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
++        l_new = l_i * alpha + tl.sum(p, axis=1)
++        p_bf16 = p.to(tl.bfloat16)
++        acc_nope = acc_nope * alpha[:, None] + tl.dot(p_bf16, kv_nope)
++        acc_rope = acc_rope * alpha[:, None] + tl.dot(p_bf16, kv_rope)
++        m_i = m_new
++        l_i = l_new
++
++    # --- Region 2: extend ---
++    e_start = tl.load(e_indptr_ptr + t)
++    e_end = tl.load(e_indptr_ptr + t + 1)
++    e_len = e_end - e_start
++
++    for k_start in tl.range(0, e_len, BLOCK_K):
++        k_pos = k_start + k_offs
++        in_range = k_pos < e_len
++        slot = tl.load(
++            e_idx_ptr + e_start + k_pos,
++            mask=in_range,
++            other=-1,
++        )
++        valid = in_range & (slot >= 0)
++        slot_safe = tl.where(valid, slot, 0)
++        outer_idx = slot_safe // E_INNER_SIZE
++        inner_idx = slot_safe - outer_idx * E_INNER_SIZE
++
++        kv_fp8 = tl.load(
++            e_fp8_ptr
++            + outer_idx[:, None] * e_fp8_so
++            + inner_idx[:, None] * e_fp8_si
++            + d_nope_offs[None, :] * e_fp8_sd,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=0.0,
++        )
++        scale_byte = tl.load(
++            e_scl_ptr
++            + outer_idx[:, None] * e_scl_so
++            + inner_idx[:, None] * e_scl_si
++            + scale_d_offs[None, :] * e_scl_st,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=127,
++        ).to(tl.int32)
++        scale_fp32 = (scale_byte << 23).to(tl.float32, bitcast=True)
++        kv_nope = kv_fp8.to(tl.bfloat16) * scale_fp32.to(tl.bfloat16)
++        kv_rope = tl.load(
++            e_rope_ptr
++            + outer_idx[:, None] * e_rope_so
++            + inner_idx[:, None] * e_rope_si
++            + d_rope_offs[None, :] * e_rope_sd,
++            mask=valid[:, None] & d_rope_mask[None, :],
++            other=0.0,
++        )
++
++        scores = tl.dot(q_nope, tl.trans(kv_nope))
++        scores += tl.dot(q_rope, tl.trans(kv_rope))
++        scores = scores * softmax_scale
++        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
++
++        m_block = tl.max(scores, axis=1)
++        m_new = tl.maximum(m_i, m_block)
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores - m_new[:, None])
++        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
++        l_new = l_i * alpha + tl.sum(p, axis=1)
++        p_bf16 = p.to(tl.bfloat16)
++        acc_nope = acc_nope * alpha[:, None] + tl.dot(p_bf16, kv_nope)
++        acc_rope = acc_rope * alpha[:, None] + tl.dot(p_bf16, kv_rope)
++        m_i = m_new
++        l_i = l_new
++
++    # --- Sink finalization (shared across both regions) ---
++    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
++    m_final = tl.maximum(m_i, sink)
++    alpha = tl.exp(m_i - m_final)
++    l_final = l_i * alpha + tl.exp(sink - m_final)
++    denom = tl.maximum(l_final, 1.0e-30)
++
++    out_nope = tl.where(
++        l_final[:, None] > 0.0,
++        (acc_nope * alpha[:, None]) / denom[:, None],
++        0.0,
++    )
++    out_rope = tl.where(
++        l_final[:, None] > 0.0,
++        (acc_rope * alpha[:, None]) / denom[:, None],
++        0.0,
++    )
++    tl.store(
++        out_ptr + t * out_stride_t
++        + h_offs[:, None] * out_stride_h
++        + d_nope_offs[None, :] * out_stride_d,
++        out_nope,
++        mask=h_mask[:, None] & d_nope_mask[None, :],
++    )
++    tl.store(
++        out_ptr + t * out_stride_t
++        + h_offs[:, None] * out_stride_h
++        + (D_NOPE + d_rope_offs[None, :]) * out_stride_d,
++        out_rope,
++        mask=h_mask[:, None] & d_rope_mask[None, :],
++    )
++
++
++def _strides(t: torch.Tensor) -> tuple[int, int, int]:
++    """Return the (outer, inner, last) element-strides of a 3D tensor."""
++    s = t.stride()
++    assert len(s) == 3, f"expected 3D tensor, got shape {t.shape}"
++    return s[0], s[1], s[2]
++
++
++def atom_sparse_attn_paged_decode_fp8_triton(
++    q: torch.Tensor,                    # [N, H, D_FULL] BF16
++    kv_fp8: torch.Tensor,               # [outer, inner, D_NOPE] FP8
++    kv_rope: torch.Tensor,              # [outer, inner, D_ROPE] BF16
++    kv_scales: torch.Tensor,            # [outer, inner, NUM_TILES] uint8
++    kv_indices: torch.Tensor,
++    kv_indptr: torch.Tensor,
++    attn_sink: torch.Tensor,
++    softmax_scale: float,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Single-source FP8-direct sparse attention. Loads FP8 nope + e8m0
++    scale + BF16 rope from one cache view, dequantizes inside the K
++    prologue, and applies attn-sink softmax finalization. Q is BF16.
++
++    Slot ids in `kv_indices` decode as
++    ``slot = outer_idx * inner_size + inner_idx``.
++    """
++    if not q.is_cuda:
++        raise RuntimeError("atom_sparse_attn_paged_decode_fp8 requires CUDA/HIP")
++    if q.dtype not in (torch.bfloat16, torch.float16):
++        raise RuntimeError(f"expects fp16/bf16 q, got {q.dtype}")
++    if kv_rope.dtype != q.dtype:
++        raise RuntimeError(f"rope dtype mismatch: rope={kv_rope.dtype}, q={q.dtype}")
++
++    T, H, D_FULL = q.shape
++    inner_size = kv_fp8.shape[1]
++    D_NOPE = kv_fp8.shape[-1]
++    D_ROPE = kv_rope.shape[-1]
++    NUM_TILES = kv_scales.shape[-1]
++    TILE_SIZE = D_NOPE // NUM_TILES
++    assert D_NOPE + D_ROPE == D_FULL, (
++        f"D_NOPE+D_ROPE={D_NOPE + D_ROPE} != D_FULL={D_FULL}"
++    )
++    assert NUM_TILES * TILE_SIZE == D_NOPE, "D_NOPE must be NUM_TILES * TILE_SIZE"
++
++    if out is None:
++        out = torch.empty_like(q)
++    kv_indices = kv_indices.to(torch.int32).contiguous()
++    kv_indptr = kv_indptr.to(torch.int32).contiguous()
++
++    block_h = 16
++    block_k = 16
++    block_d_nope = triton.next_power_of_2(D_NOPE)
++    block_d_rope = triton.next_power_of_2(D_ROPE)
++    num_tiles_padded = triton.next_power_of_2(NUM_TILES)
++
++    fp8_so, fp8_si, fp8_sd = _strides(kv_fp8)
++    rope_so, rope_si, rope_sd = _strides(kv_rope)
++    scl_so, scl_si, scl_st = _strides(kv_scales)
++
++    _atom_sparse_attn_paged_decode_fp8_kernel[(T, triton.cdiv(H, block_h))](
++        q,
++        kv_fp8, kv_rope, kv_scales,
++        kv_indices, kv_indptr,
++        attn_sink, out,
++        q.stride(0), q.stride(1), q.stride(2),
++        fp8_so, fp8_si, fp8_sd,
++        rope_so, rope_si, rope_sd,
++        scl_so, scl_si, scl_st,
++        out.stride(0), out.stride(1), out.stride(2),
++        H, D_NOPE, D_ROPE,
++        block_d_nope, block_d_rope,
++        NUM_TILES, num_tiles_padded, TILE_SIZE,
++        inner_size,
++        float(softmax_scale),
++        BLOCK_H=block_h, BLOCK_K=block_k,
++        num_warps=8,
++    )
++    return out
++
++
++def atom_sparse_attn_paged_prefill_fp8_triton(
++    q: torch.Tensor,
++    p_fp8: torch.Tensor, p_rope: torch.Tensor, p_scales: torch.Tensor,
++    p_indices: torch.Tensor, p_indptr: torch.Tensor,
++    e_fp8: torch.Tensor, e_rope: torch.Tensor, e_scales: torch.Tensor,
++    e_indices: torch.Tensor, e_indptr: torch.Tensor,
++    attn_sink: torch.Tensor,
++    softmax_scale: float,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Two-source FP8-direct sparse attention. Prefix and extend each have
++    their own (FP8 nope, BF16 rope, e8m0 scales) triple plus their own
++    `INNER_SIZE` constexpr (so the two pools may live in different cache
++    layouts simultaneously, e.g. SWA with block_size=64 and compressed
++    with block_size=4).
++    """
++    if not q.is_cuda:
++        raise RuntimeError("atom_sparse_attn_paged_prefill_fp8 requires CUDA/HIP")
++
++    T, H, D_FULL = q.shape
++    p_inner = p_fp8.shape[1]
++    e_inner = e_fp8.shape[1]
++    D_NOPE = p_fp8.shape[-1]
++    D_ROPE = p_rope.shape[-1]
++    NUM_TILES = p_scales.shape[-1]
++    TILE_SIZE = D_NOPE // NUM_TILES
++    assert (
++        e_fp8.shape[-1] == D_NOPE
++        and e_rope.shape[-1] == D_ROPE
++        and e_scales.shape[-1] == NUM_TILES
++    ), "extend pool dims must match prefix pool"
++
++    if out is None:
++        out = torch.empty_like(q)
++    p_indices = p_indices.to(torch.int32).contiguous()
++    p_indptr = p_indptr.to(torch.int32).contiguous()
++    e_indices = e_indices.to(torch.int32).contiguous()
++    e_indptr = e_indptr.to(torch.int32).contiguous()
++
++    block_h = 16
++    block_k = 16
++    block_d_nope = triton.next_power_of_2(D_NOPE)
++    block_d_rope = triton.next_power_of_2(D_ROPE)
++    num_tiles_padded = triton.next_power_of_2(NUM_TILES)
++
++    p_fp8_s = _strides(p_fp8)
++    p_rope_s = _strides(p_rope)
++    p_scl_s = _strides(p_scales)
++    e_fp8_s = _strides(e_fp8)
++    e_rope_s = _strides(e_rope)
++    e_scl_s = _strides(e_scales)
++
++    _atom_sparse_attn_paged_prefill_fp8_kernel[(T, triton.cdiv(H, block_h))](
++        q,
++        p_fp8, p_rope, p_scales, p_indices, p_indptr,
++        e_fp8, e_rope, e_scales, e_indices, e_indptr,
++        attn_sink, out,
++        q.stride(0), q.stride(1), q.stride(2),
++        p_fp8_s[0],  p_fp8_s[1],  p_fp8_s[2],
++        p_rope_s[0], p_rope_s[1], p_rope_s[2],
++        p_scl_s[0],  p_scl_s[1],  p_scl_s[2],
++        e_fp8_s[0],  e_fp8_s[1],  e_fp8_s[2],
++        e_rope_s[0], e_rope_s[1], e_rope_s[2],
++        e_scl_s[0],  e_scl_s[1],  e_scl_s[2],
++        out.stride(0), out.stride(1), out.stride(2),
++        H, D_NOPE, D_ROPE,
++        block_d_nope, block_d_rope,
++        NUM_TILES, num_tiles_padded, TILE_SIZE,
++        p_inner, e_inner,
++        float(softmax_scale),
++        BLOCK_H=block_h, BLOCK_K=block_k,
++        num_warps=8,
++    )
++    return out
+-- 
+2.34.1

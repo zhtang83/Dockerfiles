@@ -1,0 +1,1223 @@
+From 3657307d75554244bbc0bbcbc4d8b1107a105c89 Mon Sep 17 00:00:00 2001
+From: "James, Wu" <jiangmwu@amd.com>
+Date: Fri, 8 May 2026 02:21:40 +0000
+Subject: [PATCH 1/2] support profiling for each kernel
+
+---
+ .../layers/deepseek_v4_attention.py           | 447 ++++++++++--------
+ vllm/model_executor/layers/mhc.py             | 103 ++--
+ vllm/model_executor/models/deepseek_v4.py     |  31 +-
+ vllm/v1/attention/ops/dsv4_perf_probe.py      | 283 +++++++++++
+ .../v1/attention/ops/rocm_aiter_mla_sparse.py | 116 ++---
+ 5 files changed, 663 insertions(+), 317 deletions(-)
+ create mode 100644 vllm/v1/attention/ops/dsv4_perf_probe.py
+
+diff --git a/vllm/model_executor/layers/deepseek_v4_attention.py b/vllm/model_executor/layers/deepseek_v4_attention.py
+index 367bdb766..ec90d369e 100644
+--- a/vllm/model_executor/layers/deepseek_v4_attention.py
++++ b/vllm/model_executor/layers/deepseek_v4_attention.py
+@@ -287,8 +287,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         hidden_states: torch.Tensor,
+         llama_4_scaling: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+-        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe_pd as _dsv4_probe
++        with _dsv4_probe("mla.proj_q"):
++            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
++            qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+ 
+         # Pre-allocate attention output with FlashMLA-padded head count.
+         # The op writes into `o_padded`; we slice to n_local_heads after.
+@@ -310,63 +312,66 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         )
+         o = o_padded[:, : self.n_local_heads, :]
+ 
+-        if self.use_ref_wo_a_path:
+-            o_ref = _apply_inv_rope_ref(
+-                self.rotary_emb, o, positions, self.rope_head_dim
+-            ).to(torch.bfloat16)
+-            o_ref = o_ref.view(num_tokens, self.n_local_groups, -1)
+-
+-            hidden_dim = o_ref.shape[-1]
+-            if hasattr(self.wo_a, "weight_scale_inv"):
+-                wo_a_weight = self.wo_a.weight.view(
+-                    self.n_local_groups, self.o_lora_rank, hidden_dim
+-                ).to(torch.float32)
+-                wo_a_scale = _expand_2d_block_scales(
+-                    self.wo_a.weight_scale_inv.view(
+-                        self.n_local_groups, -1, self.wo_a.weight_scale_inv.shape[-1]
+-                    ),
+-                    self.o_lora_rank,
+-                    hidden_dim,
+-                )
+-                wo_a_weight = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
+-            else:
+-                wo_a_weight = self.wo_a.weight.view(
+-                    self.n_local_groups, self.o_lora_rank, hidden_dim
++        with _dsv4_probe("mla.proj_o"):
++            if self.use_ref_wo_a_path:
++                o_ref = _apply_inv_rope_ref(
++                    self.rotary_emb, o, positions, self.rope_head_dim
+                 ).to(torch.bfloat16)
+-            z = torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+-            return self.wo_b(z.flatten(1))
+-
+-        # O projection: inverse RoPE + FP8 quant + einsum + wo_b
+-        o_fp8, o_scale = fused_inv_rope_fp8_quant(
+-            o,
+-            positions,
+-            self.rotary_emb.cos_sin_cache,
+-            n_groups=self.n_local_groups,
+-            heads_per_group=self.n_local_heads // self.n_local_groups,
+-            nope_dim=self.nope_head_dim,
+-            rope_dim=self.rope_head_dim,
+-            tma_aligned_scales=self._tma_aligned_scales,
+-        )
++                o_ref = o_ref.view(num_tokens, self.n_local_groups, -1)
++
++                hidden_dim = o_ref.shape[-1]
++                if hasattr(self.wo_a, "weight_scale_inv"):
++                    wo_a_weight = self.wo_a.weight.view(
++                        self.n_local_groups, self.o_lora_rank, hidden_dim
++                    ).to(torch.float32)
++                    wo_a_scale = _expand_2d_block_scales(
++                        self.wo_a.weight_scale_inv.view(
++                            self.n_local_groups,
++                            -1,
++                            self.wo_a.weight_scale_inv.shape[-1],
++                        ),
++                        self.o_lora_rank,
++                        hidden_dim,
++                    )
++                    wo_a_weight = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
++                else:
++                    wo_a_weight = self.wo_a.weight.view(
++                        self.n_local_groups, self.o_lora_rank, hidden_dim
++                    ).to(torch.bfloat16)
++                z = torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
++                return self.wo_b(z.flatten(1))
++
++            # O projection: inverse RoPE + FP8 quant + einsum + wo_b
++            o_fp8, o_scale = fused_inv_rope_fp8_quant(
++                o,
++                positions,
++                self.rotary_emb.cos_sin_cache,
++                n_groups=self.n_local_groups,
++                heads_per_group=self.n_local_heads // self.n_local_groups,
++                nope_dim=self.nope_head_dim,
++                rope_dim=self.rope_head_dim,
++                tma_aligned_scales=self._tma_aligned_scales,
++            )
+ 
+-        wo_a_fp8 = self.wo_a.weight
+-        wo_a_scale = self.wo_a.weight_scale_inv
++            wo_a_fp8 = self.wo_a.weight
++            wo_a_scale = self.wo_a.weight_scale_inv
+ 
+-        z = torch.empty(
+-            (num_tokens, self.n_local_groups, self.o_lora_rank),
+-            device=o.device,
+-            dtype=torch.bfloat16,
+-        )
+-        torch.ops.vllm.deepseek_v4_fp8_einsum(
+-            o_fp8,
+-            o_scale,
+-            wo_a_fp8,
+-            wo_a_scale,
+-            z,
+-            "bhr,hdr->bhd",
+-            list(self._einsum_recipe),
+-        )
++            z = torch.empty(
++                (num_tokens, self.n_local_groups, self.o_lora_rank),
++                device=o.device,
++                dtype=torch.bfloat16,
++            )
++            torch.ops.vllm.deepseek_v4_fp8_einsum(
++                o_fp8,
++                o_scale,
++                wo_a_fp8,
++                wo_a_scale,
++                z,
++                "bhr,hdr->bhd",
++                list(self._einsum_recipe),
++            )
+ 
+-        return self.wo_b(z.flatten(1))
++            return self.wo_b(z.flatten(1))
+ 
+     def attention_impl(
+         self,
+@@ -376,17 +381,20 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         positions: torch.Tensor,
+         out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
+     ) -> None:
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe_pd as _dsv4_probe
++
+         forward_context = get_forward_context()
+         attn_metadata = forward_context.attn_metadata
+ 
+-        qr, kv = fused_q_kv_rmsnorm(
+-            qr,
+-            kv,
+-            self.q_norm.weight.data,
+-            self.kv_norm.weight.data,
+-            self.eps,
+-        )
+-        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
++        with _dsv4_probe("mla.proj_q"):
++            qr, kv = fused_q_kv_rmsnorm(
++                qr,
++                kv,
++                self.q_norm.weight.data,
++                self.kv_norm.weight.data,
++                self.eps,
++            )
++            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+ 
+         # Overlap kv_insert with whichever of indexer/compressor is present.
+         # Indexer implies compressor; when both exist, compressor rides on the
+@@ -398,8 +406,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+             compressor = self.compressor
+ 
+             def kv_insert_and_compress() -> None:
+-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+-                compressor(hidden_states, positions, self.rotary_emb)
++                with _dsv4_probe("mla.kv_insert"):
++                    self._fused_qnorm_rope_kv_insert(
++                        q, kv, positions, attn_metadata
++                    )
++                with _dsv4_probe("compressor"):
++                    compressor(hidden_states, positions, self.rotary_emb)
+ 
+             maybe_execute_in_parallel(
+                 lambda: indexer(hidden_states, qr, positions, self.indexer_rotary_emb),
+@@ -411,18 +423,28 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         elif self.compressor is not None:
+             # Compressor on default, kv_insert on aux.
+             compressor = self.compressor
++
++            def _run_compressor() -> None:
++                with _dsv4_probe("compressor"):
++                    compressor(hidden_states, positions, self.rotary_emb)
++
++            def _run_kv_insert() -> None:
++                with _dsv4_probe("mla.kv_insert"):
++                    self._fused_qnorm_rope_kv_insert(
++                        q, kv, positions, attn_metadata
++                    )
++
+             maybe_execute_in_parallel(
+-                lambda: compressor(hidden_states, positions, self.rotary_emb),
+-                lambda: self._fused_qnorm_rope_kv_insert(
+-                    q, kv, positions, attn_metadata
+-                ),
++                _run_compressor,
++                _run_kv_insert,
+                 self.ln_events[0],
+                 self.ln_events[1],
+                 self.aux_stream,
+             )
+         else:
+             # SWA-only layer: no compressor, no overlap.
+-            self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
++            with _dsv4_probe("mla.kv_insert"):
++                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+ 
+         # Handle dummy run (no metadata).
+         if not isinstance(attn_metadata, dict):
+@@ -1054,114 +1076,119 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+             )[0]
+             kv_raw = None
+ 
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe as _dsv4_probe
+         for chunk_idx in range(num_chunks):
+             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
+             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+             chunk_size = chunk_end - chunk_start
+-            if not swa_only:
+-                # Gather compressed KV
+-                assert attn_metadata is not None
+-                block_table = attn_metadata.block_table[num_decodes:]
++            # Probe spans gather+combine+attn for this chunk so AITER FP8-direct
++            # (raw-bytes gather + fused dequant in attn) and the torch ref (fp8
++            # -> bf16 host dequant + torch attn) are compared apples-to-apples.
++            with _dsv4_probe("mla.prefill"):
++                if not swa_only:
++                    # Gather compressed KV
++                    assert attn_metadata is not None
++                    block_table = attn_metadata.block_table[num_decodes:]
++                    if use_aiter_fp8:
++                        gather_raw_k_cache(
++                            kv_raw[:chunk_size],
++                            compressed_k_cache,
++                            seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
++                            gather_lens=None,
++                            block_table=block_table[chunk_start:chunk_end],
++                            block_size=attn_metadata.block_size // self.compress_ratio,
++                            offset=0,
++                        )
++                    else:
++                        dequantize_and_gather_k_cache(
++                            kv[:chunk_size],
++                            compressed_k_cache,
++                            seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
++                            gather_lens=None,
++                            block_table=block_table[chunk_start:chunk_end],
++                            block_size=attn_metadata.block_size // self.compress_ratio,
++                            offset=0,
++                        )
++
++                # Gather SWA KV
++                swa_block_table = swa_metadata.block_table[num_decodes:]
+                 if use_aiter_fp8:
+                     gather_raw_k_cache(
+                         kv_raw[:chunk_size],
+-                        compressed_k_cache,
+-                        seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+-                        gather_lens=None,
+-                        block_table=block_table[chunk_start:chunk_end],
+-                        block_size=attn_metadata.block_size // self.compress_ratio,
+-                        offset=0,
++                        swa_k_cache,
++                        seq_lens=seq_lens[chunk_start:chunk_end],
++                        gather_lens=gather_lens[chunk_start:chunk_end],
++                        block_table=swa_block_table[chunk_start:chunk_end],
++                        block_size=swa_metadata.block_size,
++                        offset=N,
+                     )
+                 else:
+                     dequantize_and_gather_k_cache(
+                         kv[:chunk_size],
+-                        compressed_k_cache,
+-                        seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+-                        gather_lens=None,
+-                        block_table=block_table[chunk_start:chunk_end],
+-                        block_size=attn_metadata.block_size // self.compress_ratio,
+-                        offset=0,
++                        swa_k_cache,
++                        seq_lens=seq_lens[chunk_start:chunk_end],
++                        gather_lens=gather_lens[chunk_start:chunk_end],
++                        block_table=swa_block_table[chunk_start:chunk_end],
++                        block_size=swa_metadata.block_size,
++                        offset=N,
+                     )
+ 
+-            # Gather SWA KV
+-            swa_block_table = swa_metadata.block_table[num_decodes:]
+-            if use_aiter_fp8:
+-                gather_raw_k_cache(
+-                    kv_raw[:chunk_size],
+-                    swa_k_cache,
+-                    seq_lens=seq_lens[chunk_start:chunk_end],
+-                    gather_lens=gather_lens[chunk_start:chunk_end],
+-                    block_table=swa_block_table[chunk_start:chunk_end],
+-                    block_size=swa_metadata.block_size,
+-                    offset=N,
++                # Combine the topk indices and SWA indices for gathered KV cache
++                query_start = (
++                    query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+                 )
+-            else:
+-                dequantize_and_gather_k_cache(
+-                    kv[:chunk_size],
+-                    swa_k_cache,
+-                    seq_lens=seq_lens[chunk_start:chunk_end],
+-                    gather_lens=gather_lens[chunk_start:chunk_end],
+-                    block_table=swa_block_table[chunk_start:chunk_end],
+-                    block_size=swa_metadata.block_size,
+-                    offset=N,
++                query_end = (
++                    query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+                 )
+ 
+-            # Combine the topk indices and SWA indices for gathered KV cache
+-            query_start = (
+-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+-            )
+-            query_end = (
+-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+-            )
+-
+-            combined_indices, combined_lens = combine_topk_swa_indices(
+-                topk_indices[query_start:query_end],
+-                query_start_loc[
+-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+-                ],
+-                seq_lens[chunk_start:chunk_end],
+-                gather_lens[chunk_start:chunk_end],
+-                self.window_size,
+-                self.compress_ratio,
+-                top_k,
+-                M,
+-                N,
+-            )
++                combined_indices, combined_lens = combine_topk_swa_indices(
++                    topk_indices[query_start:query_end],
++                    query_start_loc[
++                        num_decodes + chunk_start : num_decodes + chunk_end + 1
++                    ],
++                    seq_lens[chunk_start:chunk_end],
++                    gather_lens[chunk_start:chunk_end],
++                    self.window_size,
++                    self.compress_ratio,
++                    top_k,
++                    M,
++                    N,
++                )
+ 
+-            if current_platform.is_rocm():
+-                if use_aiter_fp8:
+-                    chunk_cu_q = (
+-                        query_start_loc[
+-                            num_decodes + chunk_start : num_decodes + chunk_end + 1
+-                        ]
+-                        - query_start_loc[num_decodes + chunk_start]
+-                    )
+-                    self._aiter_sparse_attn_prefill_chunk_fp8(
+-                        q=q[query_start:query_end],
+-                        kv_raw=kv_raw,
+-                        chunk_size=chunk_size,
+-                        chunk_cu_q=chunk_cu_q,
+-                        combined_indices=combined_indices,
+-                        out=output[query_start:query_end],
+-                    )
++                if current_platform.is_rocm():
++                    if use_aiter_fp8:
++                        chunk_cu_q = (
++                            query_start_loc[
++                                num_decodes + chunk_start : num_decodes + chunk_end + 1
++                            ]
++                            - query_start_loc[num_decodes + chunk_start]
++                        )
++                        self._aiter_sparse_attn_prefill_chunk_fp8(
++                            q=q[query_start:query_end],
++                            kv_raw=kv_raw,
++                            chunk_size=chunk_size,
++                            chunk_cu_q=chunk_cu_q,
++                            combined_indices=combined_indices,
++                            out=output[query_start:query_end],
++                        )
++                    else:
++                        output_chunk = self._ref_sparse_attn_prefill(
++                            q=q[query_start:query_end],
++                            kv=kv.view(-1, 1, q.shape[-1]),
++                            indices=combined_indices.unsqueeze(1),
++                            topk_length=combined_lens,
++                        )
++                        output[query_start:query_end].copy_(output_chunk.to(output.dtype))
+                 else:
+-                    output_chunk = self._ref_sparse_attn_prefill(
++                    output_chunk, _, _ = flash_mla_sparse_fwd(
+                         q=q[query_start:query_end],
+                         kv=kv.view(-1, 1, q.shape[-1]),
+                         indices=combined_indices.unsqueeze(1),
++                        sm_scale=self.scale,
++                        attn_sink=self.attn_sink,
+                         topk_length=combined_lens,
++                        out=output[query_start:query_end],
+                     )
+-                    output[query_start:query_end].copy_(output_chunk.to(output.dtype))
+-            else:
+-                output_chunk, _, _ = flash_mla_sparse_fwd(
+-                    q=q[query_start:query_end],
+-                    kv=kv.view(-1, 1, q.shape[-1]),
+-                    indices=combined_indices.unsqueeze(1),
+-                    sm_scale=self.scale,
+-                    attn_sink=self.attn_sink,
+-                    topk_length=combined_lens,
+-                    out=output[query_start:query_end],
+-                )
+ 
+     def _decode_e8m0_scales(self, scale: torch.Tensor) -> torch.Tensor:
+         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+@@ -1213,49 +1240,58 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+         swa_lens: torch.Tensor,
+         output: torch.Tensor,
+     ) -> None:
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe as _dsv4_probe
+         use_gluon = os.environ.get("VLLM_DSV4_USE_AITER_GLUON_MLA_DECODE", "0") == "1"
+         use_triton = os.environ.get("VLLM_DSV4_USE_AITER_TRITON_MLA_DECODE", "0") == "1"
+         if use_triton:
+             # FP8-direct: kernel reads raw quantized cache and dequantizes inside
+             # the MFMA prologue. Skips the host-side `_dequantize_blocked_k_cache`
+             # (which copies the entire SWA + compressed pools to BF16 every step).
+-            self._aiter_sparse_attn_decode_fp8(
+-                q=q,
+-                quant_swa_cache=self.swa_cache_layer.kv_cache,
+-                swa_indices=swa_indices,
+-                quant_extra_cache=None if swa_only else kv_cache,
+-                topk_indices=topk_indices,
+-                attn_sink=self.attn_sink[: q.shape[1]],
+-                out=output,
+-            )
++            with _dsv4_probe("mla.decode"):
++                self._aiter_sparse_attn_decode_fp8(
++                    q=q,
++                    quant_swa_cache=self.swa_cache_layer.kv_cache,
++                    swa_indices=swa_indices,
++                    quant_extra_cache=None if swa_only else kv_cache,
++                    topk_indices=topk_indices,
++                    attn_sink=self.attn_sink[: q.shape[1]],
++                    out=output,
++                )
+             return
+         # Gluon decode kernel does not yet support FP8-direct; keep the host
+         # dequant for now (separate follow-up to teach the gluon pipeline to
+         # carry FP8 + e8m0 scales through its software-pipelined K/V loads).
+-        blocked_swa = self._dequantize_blocked_k_cache(self.swa_cache_layer.kv_cache)
+-        blocked_extra = None if swa_only else self._dequantize_blocked_k_cache(kv_cache)
++        # Both branches below NEED host-side fp8->bf16 dequant before attending,
++        # so the probe wraps dequant + attention to keep the comparison fair
++        # against the FP8-direct AITER path that fuses dequant inside the kernel.
+         if use_gluon:
+-            self._aiter_sparse_attn_decode_gluon(
+-                q=q,
+-                blocked_swa=blocked_swa,
+-                swa_indices=swa_indices,
+-                blocked_extra=blocked_extra,
+-                topk_indices=topk_indices,
++            with _dsv4_probe("mla.decode"):
++                blocked_swa = self._dequantize_blocked_k_cache(self.swa_cache_layer.kv_cache)
++                blocked_extra = None if swa_only else self._dequantize_blocked_k_cache(kv_cache)
++                self._aiter_sparse_attn_decode_gluon(
++                    q=q,
++                    blocked_swa=blocked_swa,
++                    swa_indices=swa_indices,
++                    blocked_extra=blocked_extra,
++                    topk_indices=topk_indices,
++                    attn_sink=self.attn_sink[: q.shape[1]],
++                    out=output,
++                )
++            return
++        with _dsv4_probe("mla.decode"):
++            blocked_swa = self._dequantize_blocked_k_cache(self.swa_cache_layer.kv_cache)
++            blocked_extra = None if swa_only else self._dequantize_blocked_k_cache(kv_cache)
++            attn_out = self._ref_sparse_attn_decode(
++                q=q.unsqueeze(1),
++                blocked_k=blocked_swa,
++                indices_in_kvcache=swa_indices.unsqueeze(1),
++                topk_length=swa_lens,
+                 attn_sink=self.attn_sink[: q.shape[1]],
+-                out=output,
++                extra_blocked_k=blocked_extra,
++                extra_indices_in_kvcache=topk_indices,
++                extra_topk_length=topk_lens,
+             )
+-            return
+-        attn_out = self._ref_sparse_attn_decode(
+-            q=q.unsqueeze(1),
+-            blocked_k=blocked_swa,
+-            indices_in_kvcache=swa_indices.unsqueeze(1),
+-            topk_length=swa_lens,
+-            attn_sink=self.attn_sink[: q.shape[1]],
+-            extra_blocked_k=blocked_extra,
+-            extra_indices_in_kvcache=topk_indices,
+-            extra_topk_length=topk_lens,
+-        )
+-        output.copy_(attn_out.to(output.dtype))
++            output.copy_(attn_out.to(output.dtype))
+ 
+     def _split_quant_k_cache_views(
+         self, quant_k_cache: torch.Tensor
+@@ -2164,24 +2200,29 @@ class DeepseekV4Indexer(nn.Module):
+         positions: torch.Tensor,
+         rotary_emb: nn.Module,
+     ) -> torch.Tensor:
+-        q, _ = self.wq_b(qr)
+-        q = q.view(-1, self.n_head, self.head_dim)
+-        k = self.compressor(hidden_states, positions, rotary_emb)
+-        weights, _ = self.weights_proj(hidden_states)
+-        if current_platform.is_rocm() and not self.use_fp4_kv:
+-            q_quant, weights = self._quantize_indexer_q_torch(
+-                q, positions, rotary_emb.cos_sin_cache, weights
+-            )
+-        else:
+-            q_quant, weights = fused_indexer_q_rope_quant(
+-                positions,
+-                q,
+-                rotary_emb.cos_sin_cache,
+-                weights,
+-                self.softmax_scale,
+-                self.n_head**-0.5,
+-                use_fp4=self.use_fp4_kv,
+-            )
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe_pd as _dsv4_probe
++        with _dsv4_probe("indexer.gemm"):
++            q, _ = self.wq_b(qr)
++            q = q.view(-1, self.n_head, self.head_dim)
++        with _dsv4_probe("compressor"):
++            k = self.compressor(hidden_states, positions, rotary_emb)
++        with _dsv4_probe("indexer.gemm"):
++            weights, _ = self.weights_proj(hidden_states)
++        with _dsv4_probe("indexer.rope_quant"):
++            if current_platform.is_rocm() and not self.use_fp4_kv:
++                q_quant, weights = self._quantize_indexer_q_torch(
++                    q, positions, rotary_emb.cos_sin_cache, weights
++                )
++            else:
++                q_quant, weights = fused_indexer_q_rope_quant(
++                    positions,
++                    q,
++                    rotary_emb.cos_sin_cache,
++                    weights,
++                    self.softmax_scale,
++                    self.n_head**-0.5,
++                    use_fp4=self.use_fp4_kv,
++                )
+         return self.indexer_op(hidden_states, q_quant, k, weights)
+ 
+     def _quantize_indexer_q_torch(
+diff --git a/vllm/model_executor/layers/mhc.py b/vllm/model_executor/layers/mhc.py
+index 172391c12..15bffbeab 100644
+--- a/vllm/model_executor/layers/mhc.py
++++ b/vllm/model_executor/layers/mhc.py
+@@ -256,54 +256,57 @@ def mhc_pre(
+     fn_flat = fn
+ 
+     if current_platform.is_rocm():
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe_pd as _dsv4_probe
+         if _aiter_mhc_available():
+             from aiter.ops.mhc import mhc_pre as aiter_mhc_pre
+ 
+-            post_mix, comb_mix, layer_input = aiter_mhc_pre(
+-                residual_flat.contiguous(),
+-                fn_flat,
+-                hc_scale,
+-                hc_base,
+-                rms_eps,
+-                hc_pre_eps,
+-                hc_sinkhorn_eps,
+-                hc_post_mult_value,
+-                sinkhorn_repeat,
+-            )
++            with _dsv4_probe("mhc.pre"):
++                post_mix, comb_mix, layer_input = aiter_mhc_pre(
++                    residual_flat.contiguous(),
++                    fn_flat,
++                    hc_scale,
++                    hc_base,
++                    rms_eps,
++                    hc_pre_eps,
++                    hc_sinkhorn_eps,
++                    hc_post_mult_value,
++                    sinkhorn_repeat,
++                )
+             return (
+                 post_mix.view(*outer_shape, hc_mult, 1),
+                 comb_mix.view(*outer_shape, hc_mult, hc_mult),
+                 layer_input.view(*outer_shape, hidden_size),
+             )
+ 
+-        x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
+-        # [num_tokens, hc_mult * hidden_size] @ [hc_mult3, hc_mult * hidden_size].T -> [num_tokens, hc_mult3]
+-        mixes = torch.matmul(x, fn_flat.t())
+-        sqrsum = x.square().sum(dim=-1, keepdim=True)
+-        mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
++        with _dsv4_probe("mhc.pre"):
++            x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
++            # [num_tokens, hc_mult * hidden_size] @ [hc_mult3, hc_mult * hidden_size].T -> [num_tokens, hc_mult3]
++            mixes = torch.matmul(x, fn_flat.t())
++            sqrsum = x.square().sum(dim=-1, keepdim=True)
++            mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
+ 
+-        pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+-        pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
++            pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
++            pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+ 
+-        post_logits = (
+-            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+-            + hc_base[hc_mult : 2 * hc_mult]
+-        )
+-        post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
++            post_logits = (
++                mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
++                + hc_base[hc_mult : 2 * hc_mult]
++            )
++            post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
+ 
+-        comb_logits = (
+-            mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
+-            + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
+-        )
+-        comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
+-        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+-        for _ in range(sinkhorn_repeat - 1):
+-            comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
++            comb_logits = (
++                mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
++                + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
++            )
++            comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
+             comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
++            for _ in range(sinkhorn_repeat - 1):
++                comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
++                comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+ 
+-        layer_input = torch.sum(
+-            pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
+-        ).to(torch.bfloat16)
++            layer_input = torch.sum(
++                pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
++            ).to(torch.bfloat16)
+         return (
+             post_mix.view(*outer_shape, hc_mult, 1),
+             comb_mix.view(*outer_shape, hc_mult, hc_mult),
+@@ -491,6 +494,7 @@ def mhc_post(
+     comb_res_mix: torch.Tensor,
+ ) -> torch.Tensor:
+     if current_platform.is_rocm():
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe_pd as _dsv4_probe
+         if _aiter_mhc_available():
+             from aiter.ops.mhc import mhc_post as aiter_mhc_post
+ 
+@@ -504,22 +508,25 @@ def mhc_post(
+             comb_res_mix_flat = comb_res_mix.reshape(-1, hc_mult, hc_mult).contiguous()
+ 
+             out = torch.empty_like(residual_flat)
+-            aiter_mhc_post(
+-                out,
+-                x_flat,
+-                residual_flat,
+-                post_layer_mix_flat,
+-                comb_res_mix_flat,
+-            )
++            with _dsv4_probe("mhc.post"):
++                aiter_mhc_post(
++                    out,
++                    x_flat,
++                    residual_flat,
++                    post_layer_mix_flat,
++                    comb_res_mix_flat,
++                )
+             return out.view(*outer_shape, hc_mult, hidden_size)
+ 
+-        mixed_residual = torch.einsum(
+-            "...ij,...ih->...jh",
+-            comb_res_mix.to(torch.float32),
+-            residual.to(torch.float32),
+-        )
+-        post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
+-        return (mixed_residual + post_term).to(residual.dtype)
++        with _dsv4_probe("mhc.post"):
++            mixed_residual = torch.einsum(
++                "...ij,...ih->...jh",
++                comb_res_mix.to(torch.float32),
++                residual.to(torch.float32),
++            )
++            post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
++            out_value = (mixed_residual + post_term).to(residual.dtype)
++        return out_value
+     out = torch.empty_like(residual)
+     mhc_post_tilelang(
+         comb_res_mix,
+diff --git a/vllm/model_executor/models/deepseek_v4.py b/vllm/model_executor/models/deepseek_v4.py
+index 5c23bbdcd..ad428bc67 100644
+--- a/vllm/model_executor/models/deepseek_v4.py
++++ b/vllm/model_executor/models/deepseek_v4.py
+@@ -896,21 +896,24 @@ class DeepseekV4MoE(nn.Module):
+     def _forward_fused_moe(
+         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+     ) -> torch.Tensor:
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe_pd as _dsv4_probe
+         org_shape = hidden_states.shape
+         if self.experts.is_internal_router:
+             # In this case, the gate/router runs inside the FusedMoE class
+-            final_hidden_states = self.experts(
+-                hidden_states=hidden_states,
+-                router_logits=hidden_states,
+-                input_ids=input_ids,
+-            )
++            with _dsv4_probe("moe"):
++                final_hidden_states = self.experts(
++                    hidden_states=hidden_states,
++                    router_logits=hidden_states,
++                    input_ids=input_ids,
++                )
+         else:
+             router_logits, _ = self.gate(hidden_states)
+-            final_hidden_states = self.experts(
+-                hidden_states=hidden_states,
+-                router_logits=router_logits,
+-                input_ids=input_ids,
+-            )
++            with _dsv4_probe("moe"):
++                final_hidden_states = self.experts(
++                    hidden_states=hidden_states,
++                    router_logits=router_logits,
++                    input_ids=input_ids,
++                )
+ 
+         return final_hidden_states.view(org_shape)
+ 
+@@ -1544,9 +1547,11 @@ class DeepseekV4ForCausalLM(nn.Module):
+         intermediate_tensors: IntermediateTensors | None = None,
+         inputs_embeds: torch.Tensor | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
+-        hidden_states = self.model(
+-            input_ids, positions, intermediate_tensors, inputs_embeds
+-        )
++        from vllm.v1.attention.ops.dsv4_perf_probe import probe_pd as _dsv4_probe
++        with _dsv4_probe("request.total"):
++            hidden_states = self.model(
++                input_ids, positions, intermediate_tensors, inputs_embeds
++            )
+         return hidden_states
+ 
+     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+diff --git a/vllm/v1/attention/ops/dsv4_perf_probe.py b/vllm/v1/attention/ops/dsv4_perf_probe.py
+new file mode 100644
+index 000000000..92d0bb737
+--- /dev/null
++++ b/vllm/v1/attention/ops/dsv4_perf_probe.py
+@@ -0,0 +1,283 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GPU-side performance probe for DSv4 hot-path features.
++
++Wraps key call sites (mhc / mla-prefill / mla-decode / mqa-logits / moe / topk)
++with `torch.cuda.Event` start/stop pairs to attribute on-device time to a named
++bucket. Per-process / per-rank accumulator dumps a CSV on shutdown.
++
++Usage::
++
++    from vllm.v1.attention.ops.dsv4_perf_probe import probe, perf_enabled
++
++    if perf_enabled():
++        with probe("mla.decode"):
++            run_decode(...)
++    else:
++        run_decode(...)
++
++Or, if the wrapped call is unconditional and no-op overhead is acceptable
++(roughly 2 cuda event creations + 2 records per call when disabled, but we
++short-circuit to a real no-op via a singleton ``_NULL`` ctx)::
++
++    with probe("mla.decode"):
++        run_decode(...)
++
++Enable via env var ``VLLM_DSV4_PERF_PROBE=1``. Output CSV path can be
++overridden via ``VLLM_DSV4_PERF_PROBE_DIR``; default is ``/tmp``. Files are
++named ``dsv4_perf_<pid>.csv``.
++
++Each row in the CSV has columns: ``bucket,count,sum_ms,min_ms,max_ms``.
++
++A SIGUSR1 handler is also installed so an external driver can request a
++mid-run dump (useful when the engine is left running between client phases):
++``kill -USR1 <worker_pid>``.
++"""
++
++from __future__ import annotations
++
++import atexit
++import csv
++import os
++import signal
++import threading
++from contextlib import contextmanager
++from functools import lru_cache
++from typing import Iterator
++
++import torch
++
++
++@lru_cache(maxsize=1)
++def perf_enabled() -> bool:
++    val = os.environ.get("VLLM_DSV4_PERF_PROBE", "0").strip().lower()
++    return val in ("1", "true", "yes", "on")
++
++
++@lru_cache(maxsize=1)
++def _output_dir() -> str:
++    return os.environ.get("VLLM_DSV4_PERF_PROBE_DIR", "/tmp")
++
++
++@lru_cache(maxsize=1)
++def _config_label() -> str:
++    """Free-form tag the driver sets to distinguish configs in the CSV name."""
++    return os.environ.get("VLLM_DSV4_PERF_PROBE_LABEL", "run")
++
++
++class _Recorder:
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        # bucket -> [count, sum_ms, min_ms, max_ms]
++        self._buckets: dict[str, list[float]] = {}
++        # Pending events to be reaped on next sync (avoid per-call sync).
++        # Each entry: (bucket, start_event, end_event)
++        self._pending: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
++
++    def submit(
++        self,
++        bucket: str,
++        start: torch.cuda.Event,
++        end: torch.cuda.Event,
++    ) -> None:
++        with self._lock:
++            self._pending.append((bucket, start, end))
++            if len(self._pending) > 4096:
++                self._reap_locked()
++
++    def _reap_locked(self) -> None:
++        if not self._pending:
++            return
++        # Force any pending kernels to retire so all events are valid.
++        torch.cuda.synchronize()
++        for bucket, start, end in self._pending:
++            ms = float(start.elapsed_time(end))
++            slot = self._buckets.get(bucket)
++            if slot is None:
++                self._buckets[bucket] = [1.0, ms, ms, ms]
++            else:
++                slot[0] += 1.0
++                slot[1] += ms
++                slot[2] = min(slot[2], ms)
++                slot[3] = max(slot[3], ms)
++        self._pending.clear()
++
++    def reap(self) -> None:
++        with self._lock:
++            self._reap_locked()
++
++    def dump(self, path: str) -> None:
++        with self._lock:
++            self._reap_locked()
++            with open(path, "w", newline="") as f:
++                w = csv.writer(f)
++                w.writerow(["bucket", "count", "sum_ms", "min_ms", "max_ms"])
++                for bucket in sorted(self._buckets):
++                    cnt, total, lo, hi = self._buckets[bucket]
++                    w.writerow(
++                        [bucket, int(cnt), f"{total:.4f}", f"{lo:.4f}", f"{hi:.4f}"]
++                    )
++
++    def reset(self) -> None:
++        with self._lock:
++            self._buckets.clear()
++            self._pending.clear()
++
++
++_RECORDER = _Recorder()
++_DUMP_COUNTER = [0]
++
++
++def _csv_path(suffix: str = "") -> str:
++    base = f"dsv4_perf_{_config_label()}_pid{os.getpid()}"
++    if suffix:
++        base = f"{base}_{suffix}"
++    return os.path.join(_output_dir(), base + ".csv")
++
++
++def dump_now(suffix: str = "") -> str:
++    """Force a dump to the configured CSV path. Returns the path."""
++    if not suffix:
++        _DUMP_COUNTER[0] += 1
++        suffix = f"dump{_DUMP_COUNTER[0]:03d}"
++    path = _csv_path(suffix)
++    _RECORDER.dump(path)
++    return path
++
++
++def reset() -> None:
++    _RECORDER.reset()
++
++
++@contextmanager
++def _probe_real(bucket: str) -> Iterator[None]:
++    if not torch.cuda.is_available():
++        yield
++        return
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    try:
++        yield
++    finally:
++        end.record()
++        _RECORDER.submit(bucket, start, end)
++
++
++@contextmanager
++def _probe_noop(bucket: str) -> Iterator[None]:  # noqa: ARG001
++    yield
++
++
++def probe(bucket: str):
++    """Return a context manager that records GPU time to ``bucket``.
++
++    Cheap no-op when ``VLLM_DSV4_PERF_PROBE`` is not set.
++    """
++    if perf_enabled():
++        return _probe_real(bucket)
++    return _probe_noop(bucket)
++
++
++def _get_phase() -> str:
++    """Best-effort prefill/decode discriminator from the active forward
++    context. Returns ``"p"`` for prefill, ``"d"`` for decode, or ``""``
++    when the context is unavailable or the answer is ambiguous (mixed
++    prefill+decode batches default to whichever side has more tokens)."""
++    try:
++        from vllm.forward_context import get_forward_context
++        ctx = get_forward_context()
++    except Exception:
++        return ""
++    am = getattr(ctx, "attn_metadata", None) if ctx is not None else None
++    if am is None:
++        return ""
++    if isinstance(am, dict):
++        for v in am.values():
++            am = v
++            break
++    nd = getattr(am, "num_decode_tokens", 0) or 0
++    np_ = getattr(am, "num_prefill_tokens", 0) or 0
++    if not nd and not np_:
++        np_ = getattr(am, "num_prefills", 0) or 0
++        nd = getattr(am, "num_decodes", 0) or 0
++    if nd > 0 and np_ == 0:
++        return "d"
++    if np_ > 0 and nd == 0:
++        return "p"
++    if nd == 0 and np_ == 0:
++        return ""
++    return "d" if nd > np_ else "p"
++
++
++def probe_pd(bucket: str):
++    """Like ``probe`` but auto-suffixes ``.p`` (prefill) or ``.d`` (decode).
++
++    Falls back to the un-suffixed bucket when the phase cannot be
++    determined (e.g. dummy run or pre-context init).
++    """
++    if not perf_enabled():
++        return _probe_noop(bucket)
++    ph = _get_phase()
++    if ph:
++        return _probe_real(f"{bucket}.{ph}")
++    return _probe_real(bucket)
++
++
++def _shutdown_handler(*_args, **_kwargs) -> None:
++    try:
++        path = dump_now(suffix="final")
++        try:
++            import sys
++            sys.stderr.write(f"[dsv4_perf_probe] dumped to {path}\n")
++            sys.stderr.flush()
++        except Exception:
++            pass
++    except Exception:
++        pass
++
++
++def _sigusr1_handler(*_args, **_kwargs) -> None:
++    """SIGUSR1: dump current accumulator to a numbered CSV (no reset).
++
++    Driver should rename the produced file to embed the phase (length, etc.)
++    immediately after the signal returns.
++    """
++    try:
++        path = dump_now()
++        try:
++            import sys
++            sys.stderr.write(f"[dsv4_perf_probe] SIGUSR1 dumped to {path}\n")
++            sys.stderr.flush()
++        except Exception:
++            pass
++    except Exception:
++        pass
++
++
++def _sigusr2_handler(*_args, **_kwargs) -> None:
++    """SIGUSR2: reset accumulator (drop pending events too)."""
++    try:
++        reset()
++        try:
++            import sys
++            sys.stderr.write("[dsv4_perf_probe] SIGUSR2 reset\n")
++            sys.stderr.flush()
++        except Exception:
++            pass
++    except Exception:
++        pass
++
++
++def _install_handlers_once() -> None:
++    if not perf_enabled():
++        return
++    atexit.register(_shutdown_handler)
++    try:
++        signal.signal(signal.SIGUSR1, _sigusr1_handler)
++        signal.signal(signal.SIGUSR2, _sigusr2_handler)
++    except (ValueError, OSError):
++        pass
++
++
++_install_handlers_once()
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index fe284c8b5..0562f61bf 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -14,6 +14,7 @@ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import LayerNameType
+ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.dsv4_perf_probe import probe
+ 
+ if current_platform.is_cuda_alike():
+     from vllm import _custom_ops as ops
+@@ -400,18 +401,19 @@ def rocm_fp8_paged_mqa_logits(
+                 dtype=torch.float32,
+             )
+             block_size = kv_cache_fp8.shape[1]
+-            deepgemm_fp8_paged_mqa_logits(
+-                q_fp8,
+-                kv_cache_fp8,
+-                weights,
+-                out_logits,
+-                context_lens,
+-                block_tables,
+-                max_model_len,
+-                Preshuffle=False,
+-                KVBlockSize=block_size,
+-                ChunkK=256,
+-            )
++            with probe("mqa_logits.d"):
++                deepgemm_fp8_paged_mqa_logits(
++                    q_fp8,
++                    kv_cache_fp8,
++                    weights,
++                    out_logits,
++                    context_lens,
++                    block_tables,
++                    max_model_len,
++                    Preshuffle=False,
++                    KVBlockSize=block_size,
++                    ChunkK=256,
++                )
+             return out_logits
+ 
+         # Legacy: stage1 + python-side sum-over-heads.
+@@ -426,17 +428,19 @@ def rocm_fp8_paged_mqa_logits(
+         )
+         # TODO: 1. Replace _stage1 and out_qk.sum with another fused variant;
+         #       2. Remove ChunkQ when AITER PR #2891 merged
+-        deepgemm_fp8_paged_mqa_logits_stage1(
+-            q_fp8,
+-            kv_cache_fp8,
+-            weights,
+-            out_qk,
+-            context_lens,
+-            block_tables,
+-            max_model_len,
+-            ChunkQ=heads,
+-        )
+-        return out_qk.sum(dim=0)
++        with probe("mqa_logits.d"):
++            deepgemm_fp8_paged_mqa_logits_stage1(
++                q_fp8,
++                kv_cache_fp8,
++                weights,
++                out_qk,
++                context_lens,
++                block_tables,
++                max_model_len,
++                ChunkQ=heads,
++            )
++            out_summed = out_qk.sum(dim=0)
++        return out_summed
+     else:
+         return fp8_paged_mqa_logits_torch(
+             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+@@ -541,9 +545,13 @@ def rocm_fp8_mqa_logits(
+     if aiter_mqa_logits_module is not None:
+         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits
+         k_fp8, scale = kv
+-        return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
++        with probe("mqa_logits.p"):
++            out = fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
++        return out
+     else:
+-        return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
++        with probe("mqa_logits.p"):
++            out = fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
++        return out
+ 
+ 
+ def _topk_indices_torch(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:
+@@ -899,14 +907,15 @@ def rocm_aiter_sparse_attn_indexer_native(
+             # `_with_topk` variants. Both produce row-relative indices in
+             # `[0, cu_seqlen_ke[m]-cu_seqlen_ks[m])`; for V4 prefill
+             # `ks[m]==0` so this matches `_topk_indices_torch` exactly.
+-            if not _aiter_prefill_topk(
+-                logits,
+-                chunk.cu_seqlen_ks,
+-                chunk.cu_seqlen_ke,
+-                topk_indices,
+-                topk_tokens,
+-            ):
+-                topk_indices.copy_(_topk_indices_torch(logits, topk_tokens))
++            with probe("topk.prefill"):
++                if not _aiter_prefill_topk(
++                    logits,
++                    chunk.cu_seqlen_ks,
++                    chunk.cu_seqlen_ke,
++                    topk_indices,
++                    topk_tokens,
++                ):
++                    topk_indices.copy_(_topk_indices_torch(logits, topk_tokens))
+ 
+     if has_decode:
+         decode_metadata = layer_attn_metadata.decode
+@@ -950,26 +959,27 @@ def rocm_aiter_sparse_attn_indexer_native(
+         # before slicing), so we use a small temporary then `copy_` the
+         # first `num_decode_tokens` rows into the destination — same shape
+         # contract as the original `_topk_indices_torch(...)[:N]` slice.
+-        _aiter_decode_done = False
+-        if num_padded_tokens > 0:
+-            tmp_topk = torch.empty(
+-                (num_padded_tokens, topk_tokens),
+-                dtype=torch.int32,
+-                device=logits.device,
+-            )
+-            if _aiter_decode_topk(
+-                logits,
+-                decode_metadata.seq_lens,
+-                next_n,
+-                tmp_topk,
+-                topk_tokens,
+-            ):
+-                topk_indices.copy_(tmp_topk[:num_decode_tokens])
+-                _aiter_decode_done = True
+-        if not _aiter_decode_done:
+-            topk_indices.copy_(
+-                _topk_indices_torch(logits, topk_tokens)[:num_decode_tokens]
+-            )
++        with probe("topk.decode"):
++            _aiter_decode_done = False
++            if num_padded_tokens > 0:
++                tmp_topk = torch.empty(
++                    (num_padded_tokens, topk_tokens),
++                    dtype=torch.int32,
++                    device=logits.device,
++                )
++                if _aiter_decode_topk(
++                    logits,
++                    decode_metadata.seq_lens,
++                    next_n,
++                    tmp_topk,
++                    topk_tokens,
++                ):
++                    topk_indices.copy_(tmp_topk[:num_decode_tokens])
++                    _aiter_decode_done = True
++            if not _aiter_decode_done:
++                topk_indices.copy_(
++                    _topk_indices_torch(logits, topk_tokens)[:num_decode_tokens]
++                )
+ 
+         if decode_metadata.requires_padding:
+             # if padded, we need to unpack
+-- 
+2.34.1
