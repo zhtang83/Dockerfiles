@@ -1,0 +1,764 @@
+From 0a7665d100550016cf7c7e8574ca0cf60a77a447 Mon Sep 17 00:00:00 2001
+From: "James, Wu" <jiangmwu@amd.com>
+Date: Sat, 9 May 2026 14:04:02 +0000
+Subject: [PATCH] add split-k in-kernel
+
+---
+ .../layers/deepseek_v4_attention.py           | 106 +++-
+ .../attention/ops/atom_sparse_attn_paged.py   | 594 +++++++++++++++++-
+ 2 files changed, 676 insertions(+), 24 deletions(-)
+
+diff --git a/vllm/model_executor/layers/deepseek_v4_attention.py b/vllm/model_executor/layers/deepseek_v4_attention.py
+index ed7e68305..8dd36e495 100644
+--- a/vllm/model_executor/layers/deepseek_v4_attention.py
++++ b/vllm/model_executor/layers/deepseek_v4_attention.py
+@@ -1291,7 +1291,41 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+         use_triton = os.environ.get("VLLM_DSV4_USE_AITER_TRITON_MLA_DECODE", "0") == "1"
+         use_atom = os.environ.get("VLLM_DSV4_USE_ATOM_TRITON_DECODE", "0") == "1"
+         use_atom_fp8 = os.environ.get("VLLM_DSV4_USE_ATOM_TRITON_DECODE_FP8", "0") == "1"
++        # Optional per-layer hybrid routing: route compress_ratio==4 layers
++        # (large extend pool ~1.5 K K-loop slots) to AITER's FP8 decode while
++        # keeping ratio==128 / SWA-only on ATOM. The hypothesis was that
++        # AITER's split-K (Flash-Decoding-style) two-call + LSE-merge would
++        # saturate CUs better than ATOM's single-launch fused kernel on the
++        # long path; in practice (TP=4, BS=32, ISL=OSL=1024) it was 4 % WORSE
++        # — AITER's per-launch overhead and LSE-merge cost outweigh the
++        # split-K benefit on this shape, so this is OFF by default. Set the
++        # env var to "1" to re-enable for experiments / different shapes.
++        hybrid = os.environ.get("VLLM_DSV4_HYBRID_ATOM_AITER", "0") == "1"
+         if use_atom_fp8:
++            # SWA-only layers (compress_ratio<=1) and heavy-compression layers
++            # (compress_ratio==128, tiny extend pool) keep ATOM's single-launch
++            # fused path — it's already launch-overhead bound at ~218 us.
++            # Light-compression layers (compress_ratio==4) get re-routed to the
++            # AITER FP8 path which uses split-K to saturate CUs over the long
++            # K-loop. `swa_only` is True only for ratio<=1, so a non-swa-only
++            # layer with ratio<=2 falls back to ATOM (defensive).
++            route_to_aiter = (
++                hybrid
++                and (not swa_only)
++                and self.compress_ratio == 4
++            )
++            if route_to_aiter:
++                with _dsv4_probe("mla.decode"):
++                    self._aiter_sparse_attn_decode_fp8(
++                        q=q,
++                        quant_swa_cache=self.swa_cache_layer.kv_cache,
++                        swa_indices=swa_indices,
++                        quant_extra_cache=None if swa_only else kv_cache,
++                        topk_indices=topk_indices,
++                        attn_sink=self.attn_sink[: q.shape[1]],
++                        out=output,
++                    )
++                return
+             # ATOM kernel reading FP8 nope + e8m0 scales + BF16 rope
+             # directly from the V4 cache — eliminates the host-side
+             # fp8->bf16 dequant pass that the BF16 ATOM path pays.
+@@ -2070,6 +2104,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+         """
+         from vllm.v1.attention.ops.atom_sparse_attn_paged import (
+             atom_sparse_attn_paged_decode_fp8_triton,
++            atom_sparse_attn_paged_prefill_fp8_splitk_triton,
+             atom_sparse_attn_paged_prefill_fp8_triton,
+         )
+ 
+@@ -2128,22 +2163,61 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+             q.device, max(b, 512), c_topk
+         )[: b + 1]
+ 
+-        atom_sparse_attn_paged_prefill_fp8_triton(
+-            q=q,
+-            p_fp8=kv_fp8_swa,
+-            p_rope=k_bf16_swa,
+-            p_scales=kv_scales_swa,
+-            p_indices=swa_idx_flat.view(-1),
+-            p_indptr=kv_indptr_swa,
+-            e_fp8=kv_fp8_c,
+-            e_rope=k_bf16_c,
+-            e_scales=kv_scales_c,
+-            e_indices=extra_idx_flat.view(-1),
+-            e_indptr=kv_indptr_c,
+-            attn_sink=attn_sink,
+-            softmax_scale=self.scale,
+-            out=out,
+-        )
++        # Pick between the original single-launch fused kernel and the
++        # split-K (Flash-Decoding) variant. Trace data on DSV4-Flash showed
++        # both compress_ratio==4 and compress_ratio==128 SWA+compressed
++        # layers benefit massively (the original kernel takes ~2.5 ms per
++        # call; split-K with KV_SPLIT=4 brings it down to ~133 us +
++        # ~11 us reduce = ~144 us, an ~18× speedup). The "auto" default
++        # therefore routes any non-SWA-only layer to split-K. Keep the
++        # opt-out for bisect / profiling regression cases.
++        # `VLLM_DSV4_USE_ATOM_SPLITK_FP8` overrides:
++        #   "0"           → never use split-K (force original fused kernel)
++        #   "1" / "auto"  → use split-K for all SWA+compressed layers (default)
++        #   "ratio4"      → split-K only for compress_ratio==4 (legacy
++        #                   threshold; kept for ablation runs)
++        splitk_mode = os.environ.get("VLLM_DSV4_USE_ATOM_SPLITK_FP8", "auto")
++        if splitk_mode == "0":
++            use_splitk = False
++        elif splitk_mode == "ratio4":
++            use_splitk = self.compress_ratio == 4
++        else:
++            use_splitk = True
++
++        if use_splitk:
++            atom_sparse_attn_paged_prefill_fp8_splitk_triton(
++                q=q,
++                p_fp8=kv_fp8_swa,
++                p_rope=k_bf16_swa,
++                p_scales=kv_scales_swa,
++                p_indices=swa_idx_flat.view(-1),
++                p_indptr=kv_indptr_swa,
++                e_fp8=kv_fp8_c,
++                e_rope=k_bf16_c,
++                e_scales=kv_scales_c,
++                e_indices=extra_idx_flat.view(-1),
++                e_indptr=kv_indptr_c,
++                attn_sink=attn_sink,
++                softmax_scale=self.scale,
++                out=out,
++            )
++        else:
++            atom_sparse_attn_paged_prefill_fp8_triton(
++                q=q,
++                p_fp8=kv_fp8_swa,
++                p_rope=k_bf16_swa,
++                p_scales=kv_scales_swa,
++                p_indices=swa_idx_flat.view(-1),
++                p_indptr=kv_indptr_swa,
++                e_fp8=kv_fp8_c,
++                e_rope=k_bf16_c,
++                e_scales=kv_scales_c,
++                e_indices=extra_idx_flat.view(-1),
++                e_indptr=kv_indptr_c,
++                attn_sink=attn_sink,
++                softmax_scale=self.scale,
++                out=out,
++            )
+         torch.nan_to_num_(out, nan=0.0, posinf=0.0, neginf=0.0)
+ 
+     def _atom_sparse_attn_prefill_chunk_fp8(
+diff --git a/vllm/v1/attention/ops/atom_sparse_attn_paged.py b/vllm/v1/attention/ops/atom_sparse_attn_paged.py
+index b071df57c..ca06a14da 100644
+--- a/vllm/v1/attention/ops/atom_sparse_attn_paged.py
++++ b/vllm/v1/attention/ops/atom_sparse_attn_paged.py
+@@ -68,25 +68,47 @@ def _env_int(name: str, default: int) -> int:
+ 
+ # ATOM Triton sparse-attn kernel tuning knobs (env-overridable). FP8 defaults
+ # below were determined by sweeping {BLOCK_K, num_warps, num_stages} on
+-# DeepSeek-V4-Flash @ TP=4, BS=32, ISL=OSL=1024, MI300X. Best found:
+-#   BK=32, NW=4, NS=2 -> TPOT 78.69 ms (vs 119.66 ms with previous BK=16, NW=8).
+-# Direction summary:
+-#   - num_warps=4 dominates over 8 (over-saturates AMD CU SIMD32 lanes)
++# DeepSeek-V4-Flash @ TP=4, BS=32, ISL=OSL=1024, MI300X. Best found by sweep:
++#   BK=32, NW=4, NS=2 -> TPOT 78.69 ms (vs 119.66 ms baseline)
++# However NS=2 triggers an intermittent illegal-address fault on AMD, likely
++# due to Triton software-pipelined prefetch loads bypassing the per-lane mask
++# (AMD `global_load_*` issues to all lanes when `exec` is set wider than the
++# actual mask before the cond). NS=1 disables this pipelining and is stable
++# at the cost of ~4.5% TPOT (78.69 -> 82.29 ms). Defaults below favour
++# stability; override at your own risk via env vars.
++#
++# Direction summary from sweep:
++#   - num_warps=4 dominates over 8 (8 over-saturates AMD CU SIMD32 lanes)
+ #   - BLOCK_K=32 slightly better than 16 (fewer K-loop iters; LDS still fits)
+ #   - BLOCK_K>=64 hurts (LDS pressure: 64*512 fp8 = 32 KB per block)
+-#   - num_stages=2 slightly better than 1/3 on this kernel
++#   - num_stages=1 is stable; NS=2 fastest but can fault
+ # Override knobs:
+ #   VLLM_ATOM_FP8_DECODE_BLOCK_K   (default 32)
+ #   VLLM_ATOM_FP8_DECODE_NUM_WARPS (default 4)
+-#   VLLM_ATOM_FP8_DECODE_NUM_STAGES(default 2)
++#   VLLM_ATOM_FP8_DECODE_NUM_STAGES(default 1; bump to 2 for ~+4% if stable)
+ #   VLLM_ATOM_FP8_PREFILL_*        (same defaults as DECODE)
+ #   VLLM_ATOM_BF16_*               (env=0 keeps original heuristic)
+ _DECODE_FP8_BLOCK_K = _env_int("VLLM_ATOM_FP8_DECODE_BLOCK_K", 32)
+ _DECODE_FP8_NUM_WARPS = _env_int("VLLM_ATOM_FP8_DECODE_NUM_WARPS", 4)
+-_DECODE_FP8_NUM_STAGES = _env_int("VLLM_ATOM_FP8_DECODE_NUM_STAGES", 2)
++_DECODE_FP8_NUM_STAGES = _env_int("VLLM_ATOM_FP8_DECODE_NUM_STAGES", 1)
+ _PREFILL_FP8_BLOCK_K = _env_int("VLLM_ATOM_FP8_PREFILL_BLOCK_K", 32)
+ _PREFILL_FP8_NUM_WARPS = _env_int("VLLM_ATOM_FP8_PREFILL_NUM_WARPS", 4)
+-_PREFILL_FP8_NUM_STAGES = _env_int("VLLM_ATOM_FP8_PREFILL_NUM_STAGES", 2)
++_PREFILL_FP8_NUM_STAGES = _env_int("VLLM_ATOM_FP8_PREFILL_NUM_STAGES", 1)
++# Split-K (Flash-Decoding) for the FP8 two-pool prefill kernel. Each program
++# handles a slice of both pools' K-loop, then a separate reduce kernel merges
++# the KV_SPLIT partials with sink. Setting >1 expands the launch grid:
++#   grid = (T, ⌈H/BLOCK_H⌉, KV_SPLIT)
++# For TP=4, BS=32 (T=32, H=16, BLOCK_H=16 → 32 base blocks) on MI300X (304
++# CUs), the sweep on ISL=OSL=1024 found:
++#   KV_SPLIT=1  : TPOT 81.67 ms  (no split-K, baseline)
++#   KV_SPLIT=4  : TPOT 79.28 ms  ← best (-2.9 %, throughput +3.0 %)
++#   KV_SPLIT=8  : TPOT 80.19 ms
++#   KV_SPLIT=16 : TPOT 82.32 ms  (reduce-kernel overhead dominates)
++# KV_SPLIT=4 wins despite lower CU saturation because the reduce-kernel
++# work (`KV_SPLIT × BLOCK_H × BLOCK_D` per t) scales linearly with
++# KV_SPLIT, and that cost overtakes the K-loop savings past 4. The default
++# below favors that sweet spot; tweak via env for different shapes.
++_PREFILL_FP8_KV_SPLIT = _env_int("VLLM_ATOM_FP8_PREFILL_KV_SPLIT", 4)
+ # BF16 paths originally use block_k = 16 if D>=256 else 32. With env=0 we
+ # preserve that. With env>0 we override unconditionally.
+ _DECODE_BF16_BLOCK_K = _env_int("VLLM_ATOM_BF16_DECODE_BLOCK_K", 0)
+@@ -1092,3 +1114,559 @@ def atom_sparse_attn_paged_prefill_fp8_triton(
+         num_stages=_PREFILL_FP8_NUM_STAGES,
+     )
+     return out
++
++
++# ============================================================================
++# Split-K (Flash-Decoding) variant of the FP8 two-pool prefill kernel.
++#
++# The original `_atom_sparse_attn_paged_prefill_fp8_kernel` launches a 2-D
++# grid `(T, ⌈H/BLOCK_H⌉)`. For DSV4-Flash @ TP=4 BS=32 that's 32 thread
++# blocks vs MI300X's 304 CUs (~10 % utilization). On compress_ratio==4 layers
++# the K-loop is ~640-1500 slots so each block serializes a long load+dot
++# chain.
++#
++# This variant adds a third grid dim `KV_SPLIT` so each program handles a
++# slice of both the prefix and extend pools. Each writes partial
++# `(m, l, acc_nope, acc_rope)` (no sink, no normalization) into a scratchpad,
++# then a small reduce kernel merges the KV_SPLIT partials with online
++# softmax + sink finalization and writes the final output.
++#
++# Why this works where AITER's external two-call split didn't (4 % regression):
++# - AITER routed prefix and extend to *separate* kernel launches and an
++#   external LSE merge. That's 2 launches + 1 merge per layer × 20 ratio==4
++#   layers per decode iter → ~60 extra small launches, each costing 10-15 us.
++# - This in-kernel split keeps the single fused launch (1 launch + 1 small
++#   reduce per layer) and reuses the per-block softmax state across both
++#   pools — the merge cost is now a tiny `BLOCK_H × KV_SPLIT` reduction,
++#   not a full FP8 GEMM-class pass.
++# ============================================================================
++
++
++@triton.jit
++def _atom_sparse_attn_paged_prefill_fp8_splitk_kernel(
++    q_ptr,
++    p_fp8_ptr, p_rope_ptr, p_scl_ptr, p_idx_ptr, p_indptr_ptr,
++    e_fp8_ptr, e_rope_ptr, e_scl_ptr, e_idx_ptr, e_indptr_ptr,
++    # Scratchpad partials (no sink, no normalize). Layout per kernel:
++    #   partial_m / partial_l : [T, KV_SPLIT, BLOCK_H]
++    #   partial_o_nope        : [T, KV_SPLIT, BLOCK_H, BLOCK_D_NOPE]
++    #   partial_o_rope        : [T, KV_SPLIT, BLOCK_H, BLOCK_D_ROPE]
++    # NOTE: H_BLOCKS = ⌈H/BLOCK_H⌉ = 1 for DSV4-Flash (H=16/rank, BLOCK_H=16),
++    # so the head-block dim is folded into BLOCK_H here.
++    partial_m_ptr,
++    partial_l_ptr,
++    partial_o_nope_ptr,
++    partial_o_rope_ptr,
++    q_stride_t: tl.constexpr,
++    q_stride_h: tl.constexpr,
++    q_stride_d: tl.constexpr,
++    p_fp8_so: tl.constexpr,  p_fp8_si: tl.constexpr,  p_fp8_sd: tl.constexpr,
++    p_rope_so: tl.constexpr, p_rope_si: tl.constexpr, p_rope_sd: tl.constexpr,
++    p_scl_so: tl.constexpr,  p_scl_si: tl.constexpr,  p_scl_st: tl.constexpr,
++    e_fp8_so: tl.constexpr,  e_fp8_si: tl.constexpr,  e_fp8_sd: tl.constexpr,
++    e_rope_so: tl.constexpr, e_rope_si: tl.constexpr, e_rope_sd: tl.constexpr,
++    e_scl_so: tl.constexpr,  e_scl_si: tl.constexpr,  e_scl_st: tl.constexpr,
++    pm_stride_t: tl.constexpr, pm_stride_s: tl.constexpr, pm_stride_h: tl.constexpr,
++    po_n_stride_t: tl.constexpr, po_n_stride_s: tl.constexpr,
++    po_n_stride_h: tl.constexpr, po_n_stride_d: tl.constexpr,
++    po_r_stride_t: tl.constexpr, po_r_stride_s: tl.constexpr,
++    po_r_stride_h: tl.constexpr, po_r_stride_d: tl.constexpr,
++    H: tl.constexpr,
++    D_NOPE: tl.constexpr,
++    D_ROPE: tl.constexpr,
++    BLOCK_D_NOPE: tl.constexpr,
++    BLOCK_D_ROPE: tl.constexpr,
++    NUM_TILES: tl.constexpr,
++    NUM_TILES_PADDED: tl.constexpr,
++    TILE_SIZE: tl.constexpr,
++    P_INNER_SIZE: tl.constexpr,
++    E_INNER_SIZE: tl.constexpr,
++    softmax_scale: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    KV_SPLIT: tl.constexpr,
++):
++    t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    split_id = tl.program_id(2)
++
++    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
++    h_mask = h_offs < H
++    d_nope_offs = tl.arange(0, BLOCK_D_NOPE)
++    d_nope_mask = d_nope_offs < D_NOPE
++    d_rope_offs = tl.arange(0, BLOCK_D_ROPE)
++    d_rope_mask = d_rope_offs < D_ROPE
++
++    q_nope = tl.load(
++        q_ptr + t * q_stride_t
++        + h_offs[:, None] * q_stride_h
++        + d_nope_offs[None, :] * q_stride_d,
++        mask=h_mask[:, None] & d_nope_mask[None, :],
++        other=0.0,
++    )
++    q_rope = tl.load(
++        q_ptr + t * q_stride_t
++        + h_offs[:, None] * q_stride_h
++        + (D_NOPE + d_rope_offs[None, :]) * q_stride_d,
++        mask=h_mask[:, None] & d_rope_mask[None, :],
++        other=0.0,
++    )
++
++    neg_large = -3.4028234663852886e38
++    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
++    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
++    acc_nope = tl.zeros((BLOCK_H, BLOCK_D_NOPE), dtype=tl.float32)
++    acc_rope = tl.zeros((BLOCK_H, BLOCK_D_ROPE), dtype=tl.float32)
++
++    k_offs = tl.arange(0, BLOCK_K)
++    scale_d_offs = d_nope_offs // TILE_SIZE
++
++    # --- Region 1: prefix slice ---
++    # Each split takes a contiguous chunk of [0, p_len). Use ceiling division
++    # so total coverage = KV_SPLIT * p_chunk >= p_len, with the last chunk
++    # naturally truncated by `in_range = k_pos < p_hi`.
++    p_start = tl.load(p_indptr_ptr + t)
++    p_end = tl.load(p_indptr_ptr + t + 1)
++    p_len = p_end - p_start
++    p_chunk = (p_len + KV_SPLIT - 1) // KV_SPLIT
++    p_lo = split_id * p_chunk
++    p_hi = tl.minimum(p_lo + p_chunk, p_len)
++
++    for k_start in tl.range(p_lo, p_hi, BLOCK_K):
++        k_pos = k_start + k_offs
++        in_range = k_pos < p_hi
++        slot = tl.load(
++            p_idx_ptr + p_start + k_pos,
++            mask=in_range,
++            other=-1,
++        )
++        valid = in_range & (slot >= 0)
++        slot_safe = tl.where(valid, slot, 0)
++        outer_idx = slot_safe // P_INNER_SIZE
++        inner_idx = slot_safe - outer_idx * P_INNER_SIZE
++
++        kv_fp8 = tl.load(
++            p_fp8_ptr
++            + outer_idx[:, None] * p_fp8_so
++            + inner_idx[:, None] * p_fp8_si
++            + d_nope_offs[None, :] * p_fp8_sd,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=0.0,
++        )
++        scale_byte = tl.load(
++            p_scl_ptr
++            + outer_idx[:, None] * p_scl_so
++            + inner_idx[:, None] * p_scl_si
++            + scale_d_offs[None, :] * p_scl_st,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=127,
++        ).to(tl.int32)
++        scale_fp32 = (scale_byte << 23).to(tl.float32, bitcast=True)
++        kv_nope = kv_fp8.to(tl.bfloat16) * scale_fp32.to(tl.bfloat16)
++        kv_rope = tl.load(
++            p_rope_ptr
++            + outer_idx[:, None] * p_rope_so
++            + inner_idx[:, None] * p_rope_si
++            + d_rope_offs[None, :] * p_rope_sd,
++            mask=valid[:, None] & d_rope_mask[None, :],
++            other=0.0,
++        )
++
++        scores = tl.dot(q_nope, tl.trans(kv_nope))
++        scores += tl.dot(q_rope, tl.trans(kv_rope))
++        scores = scores * softmax_scale
++        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
++
++        m_block = tl.max(scores, axis=1)
++        m_new = tl.maximum(m_i, m_block)
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores - m_new[:, None])
++        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
++        l_new = l_i * alpha + tl.sum(p, axis=1)
++        p_bf16 = p.to(tl.bfloat16)
++        acc_nope = acc_nope * alpha[:, None] + tl.dot(p_bf16, kv_nope)
++        acc_rope = acc_rope * alpha[:, None] + tl.dot(p_bf16, kv_rope)
++        m_i = m_new
++        l_i = l_new
++
++    # --- Region 2: extend slice ---
++    e_start = tl.load(e_indptr_ptr + t)
++    e_end = tl.load(e_indptr_ptr + t + 1)
++    e_len = e_end - e_start
++    e_chunk = (e_len + KV_SPLIT - 1) // KV_SPLIT
++    e_lo = split_id * e_chunk
++    e_hi = tl.minimum(e_lo + e_chunk, e_len)
++
++    for k_start in tl.range(e_lo, e_hi, BLOCK_K):
++        k_pos = k_start + k_offs
++        in_range = k_pos < e_hi
++        slot = tl.load(
++            e_idx_ptr + e_start + k_pos,
++            mask=in_range,
++            other=-1,
++        )
++        valid = in_range & (slot >= 0)
++        slot_safe = tl.where(valid, slot, 0)
++        outer_idx = slot_safe // E_INNER_SIZE
++        inner_idx = slot_safe - outer_idx * E_INNER_SIZE
++
++        kv_fp8 = tl.load(
++            e_fp8_ptr
++            + outer_idx[:, None] * e_fp8_so
++            + inner_idx[:, None] * e_fp8_si
++            + d_nope_offs[None, :] * e_fp8_sd,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=0.0,
++        )
++        scale_byte = tl.load(
++            e_scl_ptr
++            + outer_idx[:, None] * e_scl_so
++            + inner_idx[:, None] * e_scl_si
++            + scale_d_offs[None, :] * e_scl_st,
++            mask=valid[:, None] & d_nope_mask[None, :],
++            other=127,
++        ).to(tl.int32)
++        scale_fp32 = (scale_byte << 23).to(tl.float32, bitcast=True)
++        kv_nope = kv_fp8.to(tl.bfloat16) * scale_fp32.to(tl.bfloat16)
++        kv_rope = tl.load(
++            e_rope_ptr
++            + outer_idx[:, None] * e_rope_so
++            + inner_idx[:, None] * e_rope_si
++            + d_rope_offs[None, :] * e_rope_sd,
++            mask=valid[:, None] & d_rope_mask[None, :],
++            other=0.0,
++        )
++
++        scores = tl.dot(q_nope, tl.trans(kv_nope))
++        scores += tl.dot(q_rope, tl.trans(kv_rope))
++        scores = scores * softmax_scale
++        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
++
++        m_block = tl.max(scores, axis=1)
++        m_new = tl.maximum(m_i, m_block)
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores - m_new[:, None])
++        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
++        l_new = l_i * alpha + tl.sum(p, axis=1)
++        p_bf16 = p.to(tl.bfloat16)
++        acc_nope = acc_nope * alpha[:, None] + tl.dot(p_bf16, kv_nope)
++        acc_rope = acc_rope * alpha[:, None] + tl.dot(p_bf16, kv_rope)
++        m_i = m_new
++        l_i = l_new
++
++    # --- Write partials (no sink, no normalize). Reduce kernel handles both. ---
++    # Empty splits leave (m, l, acc) at (-inf, 0, 0): in the reduce
++    # `alpha = exp(-inf - m_global) = 0`, so they contribute nothing. This is
++    # the standard online-softmax behaviour for "this split has zero K work".
++    pm_off = t * pm_stride_t + split_id * pm_stride_s
++    tl.store(partial_m_ptr + pm_off + h_offs * pm_stride_h, m_i, mask=h_mask)
++    tl.store(partial_l_ptr + pm_off + h_offs * pm_stride_h, l_i, mask=h_mask)
++
++    on_off = t * po_n_stride_t + split_id * po_n_stride_s
++    tl.store(
++        partial_o_nope_ptr + on_off
++        + h_offs[:, None] * po_n_stride_h
++        + d_nope_offs[None, :] * po_n_stride_d,
++        acc_nope,
++        mask=h_mask[:, None] & d_nope_mask[None, :],
++    )
++    or_off = t * po_r_stride_t + split_id * po_r_stride_s
++    tl.store(
++        partial_o_rope_ptr + or_off
++        + h_offs[:, None] * po_r_stride_h
++        + d_rope_offs[None, :] * po_r_stride_d,
++        acc_rope,
++        mask=h_mask[:, None] & d_rope_mask[None, :],
++    )
++
++
++@triton.jit
++def _atom_split_reduce_fp8_kernel(
++    partial_m_ptr,
++    partial_l_ptr,
++    partial_o_nope_ptr,
++    partial_o_rope_ptr,
++    attn_sink_ptr,
++    out_ptr,
++    pm_stride_t: tl.constexpr, pm_stride_s: tl.constexpr, pm_stride_h: tl.constexpr,
++    po_n_stride_t: tl.constexpr, po_n_stride_s: tl.constexpr,
++    po_n_stride_h: tl.constexpr, po_n_stride_d: tl.constexpr,
++    po_r_stride_t: tl.constexpr, po_r_stride_s: tl.constexpr,
++    po_r_stride_h: tl.constexpr, po_r_stride_d: tl.constexpr,
++    out_stride_t: tl.constexpr,
++    out_stride_h: tl.constexpr,
++    out_stride_d: tl.constexpr,
++    H: tl.constexpr,
++    D_NOPE: tl.constexpr,
++    D_ROPE: tl.constexpr,
++    BLOCK_D_NOPE: tl.constexpr,
++    BLOCK_D_ROPE: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    KV_SPLIT: tl.constexpr,
++):
++    """Merge KV_SPLIT partial (m, l, acc) tuples per (t, head_block) and
++    apply attn_sink finalization. Mirrors the trailing block of the original
++    kernel exactly (lines 914-944 of the non-splitk kernel).
++    """
++    t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++
++    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
++    h_mask = h_offs < H
++    d_nope_offs = tl.arange(0, BLOCK_D_NOPE)
++    d_nope_mask = d_nope_offs < D_NOPE
++    d_rope_offs = tl.arange(0, BLOCK_D_ROPE)
++    d_rope_mask = d_rope_offs < D_ROPE
++
++    neg_large = -3.4028234663852886e38
++
++    # Pass 1: find global m across splits.
++    m_global = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
++    for s in tl.static_range(0, KV_SPLIT):
++        m_s = tl.load(
++            partial_m_ptr + t * pm_stride_t + s * pm_stride_s
++            + h_offs * pm_stride_h,
++            mask=h_mask, other=neg_large,
++        )
++        m_global = tl.maximum(m_global, m_s)
++
++    # Pass 2: rescale each partial to the global m and accumulate.
++    l_global = tl.zeros((BLOCK_H,), dtype=tl.float32)
++    acc_nope = tl.zeros((BLOCK_H, BLOCK_D_NOPE), dtype=tl.float32)
++    acc_rope = tl.zeros((BLOCK_H, BLOCK_D_ROPE), dtype=tl.float32)
++    for s in tl.static_range(0, KV_SPLIT):
++        m_s = tl.load(
++            partial_m_ptr + t * pm_stride_t + s * pm_stride_s
++            + h_offs * pm_stride_h,
++            mask=h_mask, other=neg_large,
++        )
++        l_s = tl.load(
++            partial_l_ptr + t * pm_stride_t + s * pm_stride_s
++            + h_offs * pm_stride_h,
++            mask=h_mask, other=0.0,
++        )
++        on_s = tl.load(
++            partial_o_nope_ptr + t * po_n_stride_t + s * po_n_stride_s
++            + h_offs[:, None] * po_n_stride_h
++            + d_nope_offs[None, :] * po_n_stride_d,
++            mask=h_mask[:, None] & d_nope_mask[None, :],
++            other=0.0,
++        )
++        or_s = tl.load(
++            partial_o_rope_ptr + t * po_r_stride_t + s * po_r_stride_s
++            + h_offs[:, None] * po_r_stride_h
++            + d_rope_offs[None, :] * po_r_stride_d,
++            mask=h_mask[:, None] & d_rope_mask[None, :],
++            other=0.0,
++        )
++        # alpha = 0 when m_s == -inf (empty split) — naturally drops.
++        alpha = tl.exp(m_s - m_global)
++        l_global = l_global + l_s * alpha
++        acc_nope = acc_nope + on_s * alpha[:, None]
++        acc_rope = acc_rope + or_s * alpha[:, None]
++
++    # Sink merge — same math as the original kernel's tail.
++    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
++    m_final = tl.maximum(m_global, sink)
++    alpha = tl.exp(m_global - m_final)
++    l_final = l_global * alpha + tl.exp(sink - m_final)
++    denom = tl.maximum(l_final, 1.0e-30)
++
++    out_nope = tl.where(
++        l_final[:, None] > 0.0,
++        (acc_nope * alpha[:, None]) / denom[:, None],
++        0.0,
++    )
++    out_rope = tl.where(
++        l_final[:, None] > 0.0,
++        (acc_rope * alpha[:, None]) / denom[:, None],
++        0.0,
++    )
++    tl.store(
++        out_ptr + t * out_stride_t
++        + h_offs[:, None] * out_stride_h
++        + d_nope_offs[None, :] * out_stride_d,
++        out_nope,
++        mask=h_mask[:, None] & d_nope_mask[None, :],
++    )
++    tl.store(
++        out_ptr + t * out_stride_t
++        + h_offs[:, None] * out_stride_h
++        + (D_NOPE + d_rope_offs[None, :]) * out_stride_d,
++        out_rope,
++        mask=h_mask[:, None] & d_rope_mask[None, :],
++    )
++
++
++# Cache-line-keyed scratchpad pool for the split-K partials. Cudagraph-safe:
++# the kernel reads/writes via stable pointers so capture is fine.
++_SPLITK_BUFFERS: dict[tuple, dict[str, torch.Tensor]] = {}
++
++
++def _splitk_get_buffers(
++    T_max: int, num_h_blocks: int, kv_split: int,
++    block_h: int, block_d_nope: int, block_d_rope: int,
++    device: torch.device,
++) -> dict[str, torch.Tensor]:
++    """Return per-device scratchpad buffers; allocate lazily and grow T_max
++    as needed. Buffers stay alive for the lifetime of the process so
++    cudagraph capture sees stable addresses."""
++    key = (device, num_h_blocks, kv_split, block_h, block_d_nope, block_d_rope)
++    bufs = _SPLITK_BUFFERS.get(key)
++    if bufs is not None and bufs["partial_m"].shape[0] >= T_max:
++        return bufs
++
++    # Round T_max up to the next 64 to amortize re-alloc churn across
++    # benchmark batch sizes (32 → 64, 96 → 128, ...).
++    T_alloc = max(64, (T_max + 63) // 64 * 64)
++    if bufs is not None:
++        T_alloc = max(T_alloc, bufs["partial_m"].shape[0] * 2)
++
++    head_total = num_h_blocks * block_h
++    partial_m = torch.empty(
++        (T_alloc, kv_split, head_total),
++        dtype=torch.float32, device=device,
++    )
++    partial_l = torch.empty_like(partial_m)
++    partial_o_nope = torch.empty(
++        (T_alloc, kv_split, head_total, block_d_nope),
++        dtype=torch.float32, device=device,
++    )
++    partial_o_rope = torch.empty(
++        (T_alloc, kv_split, head_total, block_d_rope),
++        dtype=torch.float32, device=device,
++    )
++    bufs = {
++        "partial_m": partial_m,
++        "partial_l": partial_l,
++        "partial_o_nope": partial_o_nope,
++        "partial_o_rope": partial_o_rope,
++    }
++    _SPLITK_BUFFERS[key] = bufs
++    return bufs
++
++
++def atom_sparse_attn_paged_prefill_fp8_splitk_triton(
++    q: torch.Tensor,
++    p_fp8: torch.Tensor, p_rope: torch.Tensor, p_scales: torch.Tensor,
++    p_indices: torch.Tensor, p_indptr: torch.Tensor,
++    e_fp8: torch.Tensor, e_rope: torch.Tensor, e_scales: torch.Tensor,
++    e_indices: torch.Tensor, e_indptr: torch.Tensor,
++    attn_sink: torch.Tensor,
++    softmax_scale: float,
++    out: torch.Tensor | None = None,
++    kv_split: int | None = None,
++) -> torch.Tensor:
++    """Split-K (Flash-Decoding) variant of the FP8 two-pool prefill kernel.
++    Drop-in API replacement for `atom_sparse_attn_paged_prefill_fp8_triton`;
++    intended for layers with long K-loops (compress_ratio==4) where the
++    base kernel under-saturates GPU CUs.
++
++    Mathematical equivalence: the reduce kernel applies the same online-
++    softmax merge and attn_sink finalization as the trailing block of the
++    base kernel. With KV_SPLIT=1 the two paths are bit-equivalent modulo
++    floating-point reduction order (commutative so should match within
++    bf16 precision).
++    """
++    if not q.is_cuda:
++        raise RuntimeError("atom_sparse_attn_paged_prefill_fp8_splitk requires CUDA/HIP")
++
++    T, H, D_FULL = q.shape
++    p_inner = p_fp8.shape[1]
++    e_inner = e_fp8.shape[1]
++    D_NOPE = p_fp8.shape[-1]
++    D_ROPE = p_rope.shape[-1]
++    NUM_TILES = p_scales.shape[-1]
++    TILE_SIZE = D_NOPE // NUM_TILES
++    assert (
++        e_fp8.shape[-1] == D_NOPE
++        and e_rope.shape[-1] == D_ROPE
++        and e_scales.shape[-1] == NUM_TILES
++    ), "extend pool dims must match prefix pool"
++
++    if out is None:
++        out = torch.empty_like(q)
++    p_indices = p_indices.to(torch.int32).contiguous()
++    p_indptr = p_indptr.to(torch.int32).contiguous()
++    e_indices = e_indices.to(torch.int32).contiguous()
++    e_indptr = e_indptr.to(torch.int32).contiguous()
++
++    block_h = 16
++    block_k = _PREFILL_FP8_BLOCK_K
++    block_d_nope = triton.next_power_of_2(D_NOPE)
++    block_d_rope = triton.next_power_of_2(D_ROPE)
++    num_tiles_padded = triton.next_power_of_2(NUM_TILES)
++
++    KV_SPLIT = kv_split if kv_split is not None else _PREFILL_FP8_KV_SPLIT
++    KV_SPLIT = max(1, int(KV_SPLIT))
++
++    num_h_blocks = (H + block_h - 1) // block_h
++
++    bufs = _splitk_get_buffers(
++        T_max=T,
++        num_h_blocks=num_h_blocks,
++        kv_split=KV_SPLIT,
++        block_h=block_h,
++        block_d_nope=block_d_nope,
++        block_d_rope=block_d_rope,
++        device=q.device,
++    )
++    partial_m = bufs["partial_m"]
++    partial_l = bufs["partial_l"]
++    partial_o_nope = bufs["partial_o_nope"]
++    partial_o_rope = bufs["partial_o_rope"]
++
++    p_fp8_s = _strides(p_fp8)
++    p_rope_s = _strides(p_rope)
++    p_scl_s = _strides(p_scales)
++    e_fp8_s = _strides(e_fp8)
++    e_rope_s = _strides(e_rope)
++    e_scl_s = _strides(e_scales)
++
++    pm_s = partial_m.stride()
++    on_s = partial_o_nope.stride()
++    or_s = partial_o_rope.stride()
++
++    _atom_sparse_attn_paged_prefill_fp8_splitk_kernel[
++        (T, num_h_blocks, KV_SPLIT)
++    ](
++        q,
++        p_fp8, p_rope, p_scales, p_indices, p_indptr,
++        e_fp8, e_rope, e_scales, e_indices, e_indptr,
++        partial_m, partial_l, partial_o_nope, partial_o_rope,
++        q.stride(0), q.stride(1), q.stride(2),
++        p_fp8_s[0],  p_fp8_s[1],  p_fp8_s[2],
++        p_rope_s[0], p_rope_s[1], p_rope_s[2],
++        p_scl_s[0],  p_scl_s[1],  p_scl_s[2],
++        e_fp8_s[0],  e_fp8_s[1],  e_fp8_s[2],
++        e_rope_s[0], e_rope_s[1], e_rope_s[2],
++        e_scl_s[0],  e_scl_s[1],  e_scl_s[2],
++        pm_s[0], pm_s[1], pm_s[2],
++        on_s[0], on_s[1], on_s[2], on_s[3],
++        or_s[0], or_s[1], or_s[2], or_s[3],
++        H, D_NOPE, D_ROPE,
++        block_d_nope, block_d_rope,
++        NUM_TILES, num_tiles_padded, TILE_SIZE,
++        p_inner, e_inner,
++        float(softmax_scale),
++        BLOCK_H=block_h, BLOCK_K=block_k,
++        KV_SPLIT=KV_SPLIT,
++        num_warps=_PREFILL_FP8_NUM_WARPS,
++        num_stages=_PREFILL_FP8_NUM_STAGES,
++    )
++
++    _atom_split_reduce_fp8_kernel[(T, num_h_blocks)](
++        partial_m, partial_l, partial_o_nope, partial_o_rope,
++        attn_sink, out,
++        pm_s[0], pm_s[1], pm_s[2],
++        on_s[0], on_s[1], on_s[2], on_s[3],
++        or_s[0], or_s[1], or_s[2], or_s[3],
++        out.stride(0), out.stride(1), out.stride(2),
++        H, D_NOPE, D_ROPE,
++        block_d_nope, block_d_rope,
++        BLOCK_H=block_h,
++        KV_SPLIT=KV_SPLIT,
++        num_warps=4,
++        num_stages=1,
++    )
++    return out
+-- 
+2.34.1
