@@ -1,0 +1,77 @@
+From 99a10ff6680d7aab7d37f8c659e4ee8fb1f9c1ba Mon Sep 17 00:00:00 2001
+From: "James, Wu" <jiangmwu@amd.com>
+Date: Sat, 9 May 2026 14:47:23 +0000
+Subject: [PATCH] add kernel for split-k kernel
+
+---
+ .../attention/ops/atom_sparse_attn_paged.py   | 34 ++++++++++++++++---
+ 1 file changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/v1/attention/ops/atom_sparse_attn_paged.py b/vllm/v1/attention/ops/atom_sparse_attn_paged.py
+index ca06a14da..0e053a751 100644
+--- a/vllm/v1/attention/ops/atom_sparse_attn_paged.py
++++ b/vllm/v1/attention/ops/atom_sparse_attn_paged.py
+@@ -109,6 +109,27 @@ _PREFILL_FP8_NUM_STAGES = _env_int("VLLM_ATOM_FP8_PREFILL_NUM_STAGES", 1)
+ # KV_SPLIT, and that cost overtakes the K-loop savings past 4. The default
+ # below favors that sweet spot; tweak via env for different shapes.
+ _PREFILL_FP8_KV_SPLIT = _env_int("VLLM_ATOM_FP8_PREFILL_KV_SPLIT", 4)
++# Split-K-specific tuning knobs. Per-program K work is K/KV_SPLIT (~1/4 of
++# the fused kernel's K-loop), so optimal `BLOCK_K`, `num_warps`, and
++# `num_stages` differ from the fused kernel's defaults. Sweep on
++# DSV4-Flash @ TP=4 BS=32 ISL=OSL=1024 found:
++#   BLOCK_K=32  NW=4  NS=1  TPOT 54.35 ms (matches fused defaults)
++#   BLOCK_K=32  NW=4  NS=2  TPOT 52.34 ms ← best
++#   BLOCK_K=64  NW=4  NS=1  TPOT 58.22 ms
++#   BLOCK_K=64  NW=4  NS=2  TPOT 80.49 ms (BLOCK_K=64 + NS=2 regresses)
++#   *_w8        TPOT 105+ ms (NW=8 over-saturates AMD CU SIMD32 lanes)
++# The big surprise vs the fused kernel: NS=2 is *safe* here. The fused
++# kernel's NS=2 triggered an async `Memory access fault by GPU` on shutdown
++# because the long K-loop (~1500 slots) lets many prefetched loads
++# accumulate before the per-lane mask catches up — splitting the K-loop
++# down to ~350 slots/program keeps the prefetch window small enough that
++# AMD `global_load_*` masking stays consistent.
++# Set env to 0 to fall back to the fused kernel's defaults (matches the
++# pre-sweep behaviour for ablation).
++_SPLITK_BLOCK_K = _env_int("VLLM_ATOM_FP8_SPLITK_BLOCK_K", 32)
++_SPLITK_NUM_WARPS = _env_int("VLLM_ATOM_FP8_SPLITK_NUM_WARPS", 4)
++_SPLITK_NUM_STAGES = _env_int("VLLM_ATOM_FP8_SPLITK_NUM_STAGES", 2)
++_SPLITK_REDUCE_NUM_WARPS = _env_int("VLLM_ATOM_FP8_SPLITK_REDUCE_NUM_WARPS", 4)
+ # BF16 paths originally use block_k = 16 if D>=256 else 32. With env=0 we
+ # preserve that. With env>0 we override unconditionally.
+ _DECODE_BF16_BLOCK_K = _env_int("VLLM_ATOM_BF16_DECODE_BLOCK_K", 0)
+@@ -1592,7 +1613,12 @@ def atom_sparse_attn_paged_prefill_fp8_splitk_triton(
+     e_indptr = e_indptr.to(torch.int32).contiguous()
+ 
+     block_h = 16
+-    block_k = _PREFILL_FP8_BLOCK_K
++    # Split-K-specific knobs fall back to the fused-kernel defaults when not
++    # set via env. The split-K kernel has a smaller per-program K-loop, so
++    # its sweet spots may be different — override via the SPLITK_* env vars.
++    block_k = _SPLITK_BLOCK_K if _SPLITK_BLOCK_K > 0 else _PREFILL_FP8_BLOCK_K
++    num_warps = _SPLITK_NUM_WARPS if _SPLITK_NUM_WARPS > 0 else _PREFILL_FP8_NUM_WARPS
++    num_stages = _SPLITK_NUM_STAGES if _SPLITK_NUM_STAGES > 0 else _PREFILL_FP8_NUM_STAGES
+     block_d_nope = triton.next_power_of_2(D_NOPE)
+     block_d_rope = triton.next_power_of_2(D_ROPE)
+     num_tiles_padded = triton.next_power_of_2(NUM_TILES)
+@@ -1651,8 +1677,8 @@ def atom_sparse_attn_paged_prefill_fp8_splitk_triton(
+         float(softmax_scale),
+         BLOCK_H=block_h, BLOCK_K=block_k,
+         KV_SPLIT=KV_SPLIT,
+-        num_warps=_PREFILL_FP8_NUM_WARPS,
+-        num_stages=_PREFILL_FP8_NUM_STAGES,
++        num_warps=num_warps,
++        num_stages=num_stages,
+     )
+ 
+     _atom_split_reduce_fp8_kernel[(T, num_h_blocks)](
+@@ -1666,7 +1692,7 @@ def atom_sparse_attn_paged_prefill_fp8_splitk_triton(
+         block_d_nope, block_d_rope,
+         BLOCK_H=block_h,
+         KV_SPLIT=KV_SPLIT,
+-        num_warps=4,
++        num_warps=_SPLITK_REDUCE_NUM_WARPS,
+         num_stages=1,
+     )
+     return out
+-- 
+2.34.1
