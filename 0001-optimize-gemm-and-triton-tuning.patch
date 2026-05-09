@@ -1,0 +1,188 @@
+From 97e99c4d2b37dd427540ff2e3005bbaec104e907 Mon Sep 17 00:00:00 2001
+From: "James, Wu" <jiangmwu@amd.com>
+Date: Sat, 9 May 2026 10:15:29 +0000
+Subject: [PATCH] optimize gemm and triton tuning
+
+---
+ .../scaled_mm/BlockScaledMMLinearKernel.py    | 13 +++-
+ .../attention/ops/atom_sparse_attn_paged.py   | 67 ++++++++++++++++---
+ 2 files changed, 71 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/BlockScaledMMLinearKernel.py b/vllm/model_executor/kernels/linear/scaled_mm/BlockScaledMMLinearKernel.py
+index d738796ce..44ca4109f 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/BlockScaledMMLinearKernel.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/BlockScaledMMLinearKernel.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+ from typing import ClassVar
+@@ -13,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+     process_fp8_weight_block_strategy,
+ )
+ from vllm.model_executor.utils import replace_parameter
++from vllm.platforms import current_platform
+ 
+ from ..base import (
+     FP8Params,
+@@ -56,7 +58,16 @@ class Fp8BlockScaledMMLinearKernel(
+             num_token_padding=self.get_output_padding(),
+             use_ue8m0=False,
+         )
+-        self.use_triton = False
++        # On ROCm without AITER FP8 linear, the default native fallback for
++        # per-group activation quant decomposes into ~8 unfused PyTorch ops
++        # (abs / max / bf16->fp32 / mul / clamp / fp8_copy ...), inflating
++        # decode iter time. Force the Triton fused per-token-group quant
++        # kernel on ROCm. Override with VLLM_FP8_BLOCK_QUANT_USE_TRITON.
++        env = os.environ.get("VLLM_FP8_BLOCK_QUANT_USE_TRITON")
++        if env is not None:
++            self.use_triton = env not in ("0", "false", "False", "")
++        else:
++            self.use_triton = current_platform.is_rocm()
+ 
+     @classmethod
+     def can_implement(cls, config: FP8ScaledMMLinearLayerConfig):
+diff --git a/vllm/v1/attention/ops/atom_sparse_attn_paged.py b/vllm/v1/attention/ops/atom_sparse_attn_paged.py
+index d10fba299..b071df57c 100644
+--- a/vllm/v1/attention/ops/atom_sparse_attn_paged.py
++++ b/vllm/v1/attention/ops/atom_sparse_attn_paged.py
+@@ -49,11 +49,54 @@ All kernels apply per-head softmax-sink finalization (DeepSeek V4
+ attn_sink contributes to the denominator only, V_sink == 0).
+ """
+ 
++import os
++
+ import torch
+ import triton
+ import triton.language as tl
+ 
+ 
++def _env_int(name: str, default: int) -> int:
++    v = os.environ.get(name)
++    if v is None or v == "":
++        return default
++    try:
++        return int(v)
++    except ValueError:
++        return default
++
++
++# ATOM Triton sparse-attn kernel tuning knobs (env-overridable). FP8 defaults
++# below were determined by sweeping {BLOCK_K, num_warps, num_stages} on
++# DeepSeek-V4-Flash @ TP=4, BS=32, ISL=OSL=1024, MI300X. Best found:
++#   BK=32, NW=4, NS=2 -> TPOT 78.69 ms (vs 119.66 ms with previous BK=16, NW=8).
++# Direction summary:
++#   - num_warps=4 dominates over 8 (over-saturates AMD CU SIMD32 lanes)
++#   - BLOCK_K=32 slightly better than 16 (fewer K-loop iters; LDS still fits)
++#   - BLOCK_K>=64 hurts (LDS pressure: 64*512 fp8 = 32 KB per block)
++#   - num_stages=2 slightly better than 1/3 on this kernel
++# Override knobs:
++#   VLLM_ATOM_FP8_DECODE_BLOCK_K   (default 32)
++#   VLLM_ATOM_FP8_DECODE_NUM_WARPS (default 4)
++#   VLLM_ATOM_FP8_DECODE_NUM_STAGES(default 2)
++#   VLLM_ATOM_FP8_PREFILL_*        (same defaults as DECODE)
++#   VLLM_ATOM_BF16_*               (env=0 keeps original heuristic)
++_DECODE_FP8_BLOCK_K = _env_int("VLLM_ATOM_FP8_DECODE_BLOCK_K", 32)
++_DECODE_FP8_NUM_WARPS = _env_int("VLLM_ATOM_FP8_DECODE_NUM_WARPS", 4)
++_DECODE_FP8_NUM_STAGES = _env_int("VLLM_ATOM_FP8_DECODE_NUM_STAGES", 2)
++_PREFILL_FP8_BLOCK_K = _env_int("VLLM_ATOM_FP8_PREFILL_BLOCK_K", 32)
++_PREFILL_FP8_NUM_WARPS = _env_int("VLLM_ATOM_FP8_PREFILL_NUM_WARPS", 4)
++_PREFILL_FP8_NUM_STAGES = _env_int("VLLM_ATOM_FP8_PREFILL_NUM_STAGES", 2)
++# BF16 paths originally use block_k = 16 if D>=256 else 32. With env=0 we
++# preserve that. With env>0 we override unconditionally.
++_DECODE_BF16_BLOCK_K = _env_int("VLLM_ATOM_BF16_DECODE_BLOCK_K", 0)
++_DECODE_BF16_NUM_WARPS = _env_int("VLLM_ATOM_BF16_DECODE_NUM_WARPS", 8)
++_DECODE_BF16_NUM_STAGES = _env_int("VLLM_ATOM_BF16_DECODE_NUM_STAGES", 2)
++_PREFILL_BF16_BLOCK_K = _env_int("VLLM_ATOM_BF16_PREFILL_BLOCK_K", 0)
++_PREFILL_BF16_NUM_WARPS = _env_int("VLLM_ATOM_BF16_PREFILL_NUM_WARPS", 8)
++_PREFILL_BF16_NUM_STAGES = _env_int("VLLM_ATOM_BF16_PREFILL_NUM_STAGES", 2)
++
++
+ @triton.jit
+ def _atom_sparse_attn_paged_decode_kernel(
+     q_ptr,                # [N, H, D]
+@@ -339,7 +382,9 @@ def atom_sparse_attn_paged_decode_triton(
+ 
+     block_h = 16
+     block_d = triton.next_power_of_2(D)
+-    block_k = 16 if D >= 256 else 32
++    block_k = _DECODE_BF16_BLOCK_K if _DECODE_BF16_BLOCK_K > 0 else (
++        16 if D >= 256 else 32
++    )
+ 
+     _atom_sparse_attn_paged_decode_kernel[(T, triton.cdiv(H, block_h))](
+         q,
+@@ -362,7 +407,8 @@ def atom_sparse_attn_paged_decode_triton(
+         BLOCK_H=block_h,
+         BLOCK_D=block_d,
+         BLOCK_K=block_k,
+-        num_warps=8,
++        num_warps=_DECODE_BF16_NUM_WARPS,
++        num_stages=_DECODE_BF16_NUM_STAGES,
+     )
+     return out
+ 
+@@ -407,7 +453,9 @@ def atom_sparse_attn_paged_prefill_triton(
+ 
+     block_h = 16
+     block_d = triton.next_power_of_2(D)
+-    block_k = 16 if D >= 256 else 32
++    block_k = _PREFILL_BF16_BLOCK_K if _PREFILL_BF16_BLOCK_K > 0 else (
++        16 if D >= 256 else 32
++    )
+ 
+     _atom_sparse_attn_paged_prefill_kernel[(T, triton.cdiv(H, block_h))](
+         q,
+@@ -435,7 +483,8 @@ def atom_sparse_attn_paged_prefill_triton(
+         BLOCK_H=block_h,
+         BLOCK_D=block_d,
+         BLOCK_K=block_k,
+-        num_warps=8,
++        num_warps=_PREFILL_BF16_NUM_WARPS,
++        num_stages=_PREFILL_BF16_NUM_STAGES,
+     )
+     return out
+ 
+@@ -937,7 +986,7 @@ def atom_sparse_attn_paged_decode_fp8_triton(
+     kv_indptr = kv_indptr.to(torch.int32).contiguous()
+ 
+     block_h = 16
+-    block_k = 16
++    block_k = _DECODE_FP8_BLOCK_K
+     block_d_nope = triton.next_power_of_2(D_NOPE)
+     block_d_rope = triton.next_power_of_2(D_ROPE)
+     num_tiles_padded = triton.next_power_of_2(NUM_TILES)
+@@ -962,7 +1011,8 @@ def atom_sparse_attn_paged_decode_fp8_triton(
+         inner_size,
+         float(softmax_scale),
+         BLOCK_H=block_h, BLOCK_K=block_k,
+-        num_warps=8,
++        num_warps=_DECODE_FP8_NUM_WARPS,
++        num_stages=_DECODE_FP8_NUM_STAGES,
+     )
+     return out
+ 
+@@ -1007,7 +1057,7 @@ def atom_sparse_attn_paged_prefill_fp8_triton(
+     e_indptr = e_indptr.to(torch.int32).contiguous()
+ 
+     block_h = 16
+-    block_k = 16
++    block_k = _PREFILL_FP8_BLOCK_K
+     block_d_nope = triton.next_power_of_2(D_NOPE)
+     block_d_rope = triton.next_power_of_2(D_ROPE)
+     num_tiles_padded = triton.next_power_of_2(NUM_TILES)
+@@ -1038,6 +1088,7 @@ def atom_sparse_attn_paged_prefill_fp8_triton(
+         p_inner, e_inner,
+         float(softmax_scale),
+         BLOCK_H=block_h, BLOCK_K=block_k,
+-        num_warps=8,
++        num_warps=_PREFILL_FP8_NUM_WARPS,
++        num_stages=_PREFILL_FP8_NUM_STAGES,
+     )
+     return out
+-- 
+2.34.1
