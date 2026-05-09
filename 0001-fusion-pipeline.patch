@@ -1,0 +1,128 @@
+From c52f58343074db90266fbc2e03fd7c9faaf108d4 Mon Sep 17 00:00:00 2001
+From: "James, Wu" <jiangmwu@amd.com>
+Date: Sat, 9 May 2026 08:19:31 +0000
+Subject: [PATCH] fusion pipeline
+
+---
+ .../layers/deepseek_v4_attention.py           | 14 ++++++++++-
+ .../layers/quantization/utils/fp8_utils.py    |  8 +++++++
+ .../ops/deepseek_v4_ops/fused_indexer_q.py    | 24 ++++++++++++++-----
+ 3 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/model_executor/layers/deepseek_v4_attention.py b/vllm/model_executor/layers/deepseek_v4_attention.py
+index 275814381..ed7e68305 100644
+--- a/vllm/model_executor/layers/deepseek_v4_attention.py
++++ b/vllm/model_executor/layers/deepseek_v4_attention.py
+@@ -2647,7 +2647,19 @@ class DeepseekV4Indexer(nn.Module):
+         with _dsv4_probe("indexer.gemm"):
+             weights, _ = self.weights_proj(hidden_states)
+         with _dsv4_probe("indexer.rope_quant"):
+-            if current_platform.is_rocm() and not self.use_fp4_kv:
++            # Use the fused Triton kernel on every platform. It is now
++            # platform-aware (passes fp8_max=224.0 and uses e4m3fnuz on
++            # ROCm/MI300x; 448.0 + e4m3fn on CUDA). The previous unfused
++            # `_quantize_indexer_q_torch` ROCm fallback decomposed into 8
++            # PyTorch ops (~50us/layer) — see profile analysis.
++            #
++            # Set VLLM_DSV4_USE_INDEXER_Q_TORCH_FALLBACK=1 to force the
++            # unfused fallback (e.g. for parity debugging).
++            if (
++                current_platform.is_rocm()
++                and not self.use_fp4_kv
++                and os.environ.get("VLLM_DSV4_USE_INDEXER_Q_TORCH_FALLBACK", "0") == "1"
++            ):
+                 q_quant, weights = self._quantize_indexer_q_torch(
+                     q, positions, rotary_emb.cos_sin_cache, weights
+                 )
+diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+index d9aab35c2..5411416b6 100644
+--- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+@@ -1293,6 +1293,14 @@ def process_fp8_weight_block_strategy(
+             weight=weight, weight_scale=weight_scale
+         )
+ 
++    # On ROCm, Triton cannot bind E8M0 scale tensors directly, so the GEMM
++    # kernel would otherwise upcast `weight_scale` (Bs) to fp32 on every call
++    # via `_upcast_e8m0_to_fp32(...).contiguous()`. Do it ONCE here so every
++    # subsequent w8a8_triton_block_scaled_mm() call sees fp32 directly and
++    # skips a per-call `lshift_kernel` + `direct_copy_kernel` pair.
++    if current_platform.is_rocm() and weight_scale.dtype == torch.float8_e8m0fnu:
++        weight_scale = _upcast_e8m0_to_fp32(weight_scale).contiguous()
++
+     weight = _maybe_pad_fp8_weight(weight)
+     return weight, weight_scale
+ 
+diff --git a/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py b/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py
+index 0254a4675..0fa8b33dd 100644
+--- a/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py
++++ b/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py
+@@ -94,6 +94,7 @@ def _fused_indexer_q_rope_quant_kernel(
+     index_q_fp8_stride0,
+     index_q_fp8_stride1,
+     INDEX_Q_HEAD_DIM: tl.constexpr,
++    FP8_MAX: tl.constexpr,
+     # Index weights
+     index_weights_ptr,
+     index_weights_stride,
+@@ -141,26 +142,29 @@ def _fused_indexer_q_rope_quant_kernel(
+         nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
+         x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
+         amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
+-    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
++    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
+     index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+ 
+-    # Store quantized values to index_q_fp8
++    # Store quantized values to index_q_fp8. Dest dtype is taken from the
++    # output pointer (e4m3fn on CUDA, e4m3fnuz on ROCm/MI300x) so the same
++    # kernel works on both platforms.
++    fp8_dtype = index_q_fp8_ptr.dtype.element_ty
+     fp8_base_ptr = (
+         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
+     )
+     if INDEX_Q_NOPE_DIM > 0:
+         tl.store(
+             fp8_base_ptr + nope_offset,
+-            tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
++            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
+         )
+     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
+     tl.store(
+         fp8_rot_base + half_offset * 2,
+-        tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv),
++        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
+     )
+     tl.store(
+         fp8_rot_base + half_offset * 2 + 1,
+-        tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv),
++        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
+     )
+ 
+     # FP8 weight-fold contract:
+@@ -391,7 +395,14 @@ def fused_indexer_q_rope_quant(
+             index_q_scale.view(torch.int32).squeeze(-1),
+         ), index_weights_out
+ 
+-    index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
++    # Use platform-native FP8 dtype (e4m3fnuz on ROCm/MI300x, e4m3fn on
++    # CUDA). The corresponding fp8_max differs (224.0 vs 448.0) and is
++    # passed as a constexpr to the kernel.
++    from vllm.platforms import current_platform
++
++    fp8_dtype = current_platform.fp8_dtype()
++    fp8_max = 224.0 if current_platform.is_fp8_fnuz() else 448.0
++    index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
+     _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+         positions,
+         index_q,
+@@ -404,6 +415,7 @@ def fused_indexer_q_rope_quant(
+         index_q_fp8.stride(0),
+         index_q_fp8.stride(1),
+         index_q_head_dim,
++        fp8_max,
+         index_weights,
+         index_weights.stride(0),
+         index_weights_softmax_scale,
+-- 
+2.34.1
