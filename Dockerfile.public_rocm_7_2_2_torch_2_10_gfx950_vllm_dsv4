@@ -62,7 +62,7 @@ RUN --mount=target=/var/lib/apt/lists,type=cache,sharing=locked \
 
 ENV ROCM_HOME=/opt/rocm
 ENV CPLUS_INCLUDE_PATH=/opt/rocm/include:
-ENV LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:
 ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 
 #
@@ -140,9 +140,10 @@ RUN --mount=type=bind,source=.,target=/tmp/home \
     mkdir -p ${COMMON_WORKDIR}/aiter && \
     tar -xzf /tmp/home/aiter.tar.gz -C ${COMMON_WORKDIR}/aiter --strip-components=1 && \ 
     mkdir -p ${COMMON_WORKDIR}/vllm && \
-    tar -xzf /tmp/home/vllm.tar.gz -C ${COMMON_WORKDIR}/vllm --strip-components=1 && \
-    rm -rf ${COMMON_WORKDIR}/aiter/.git && \
-    rm -rf ${COMMON_WORKDIR}/vllm/.git
+    tar -xzf /tmp/home/vllm.tar.gz -C ${COMMON_WORKDIR}/vllm --strip-components=1
+
+RUN git config --global --add safe.directory ${COMMON_WORKDIR}/aiter && \
+    git config --global --add safe.directory ${COMMON_WORKDIR}/vllm
 
 RUN cd aiter && \
     pip install -r requirements.txt
@@ -180,6 +181,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements/rocm.txt && \
     python3 -m pip install -v --no-build-isolation -e .[fastsafetensors] && \
 	rm -rf /tmp/*
+
+RUN rm -rf ${COMMON_WORKDIR}/aiter/.git && \
+    rm -rf ${COMMON_WORKDIR}/vllm/.git  && \
+    rm -rf ${COMMON_WORKDIR}/vllm/BEST_CONFIG_CMD.md
 
 RUN if [ ${BUILD_RPD} -eq "1" ]; then \
     git clone -b nvtx_enabled https://github.com/ROCm/rocmProfileData.git \
