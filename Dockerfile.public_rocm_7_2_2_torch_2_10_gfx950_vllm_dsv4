@@ -175,8 +175,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     sed -i '/torch/d' requirements/build/rocm.txt && \
     sed -i '/amdsmi/d' requirements/build/rocm.txt && \
     sed -i '/^\s*\"torch/d' pyproject.toml && \
-    sed -i '/^tilelang==0.1.9/a apache-tvm-ffi==0.1.11' requirements/rocm.txt && \
-    pip install -U pandas "tilelang==0.1.9" "apache-tvm-ffi==0.1.11" && \
+    pip install -U pandas tilelang && \
     ROCM_PATH=/opt/rocm pip install --no-binary :all: fastsafetensors && \
     pip install -r requirements/build/rocm.txt && \
     pip install -r requirements/rocm.txt && \
@@ -207,7 +206,7 @@ ENV GPU_ARCHS=${GFX_ARCH}
 COPY <<EOF /tmp/aot.patch
 --- /tmp/aot.py 2026-03-17 12:32:53.024315485 +0800
 +++ aot.py      2026-03-17 12:33:09.925405034 +0800
-@@ -122,5 +122,10 @@
+@@ -122,7 +122,11 @@
          "module_mla_metadata",
          "module_mla_reduce",
          "module_mla_asm",
@@ -217,11 +216,10 @@ COPY <<EOF /tmp/aot.patch
 +        "module_moe_ck2stages",
 +        "module_activation",
 +        "module_fmha_v3_varlen_fwd",
-+        "module_top_k_per_row",
      ]
      print(f"modules_to_build: {modules_to_build}")
      start_time = time.time()
-@@ -181,6 +186,9 @@
+@@ -181,6 +185,9 @@
                  "torch_exclude": build_args.get("torch_exclude", False),
              }
  

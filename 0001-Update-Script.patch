@@ -1,0 +1,52 @@
+From 6e163cf3e698ea9d47ef216185d546bdaaaa4b6f Mon Sep 17 00:00:00 2001
+From: Zhizhen Tang <zhtang@amd.com>
+Date: Mon, 22 Jun 2026 06:59:42 +0000
+Subject: [PATCH] Update Script
+
+---
+ server_best_pro_tp8.sh | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/server_best_pro_tp8.sh b/server_best_pro_tp8.sh
+index ccf183bf0..f5015c9a5 100644
+--- a/server_best_pro_tp8.sh
++++ b/server_best_pro_tp8.sh
+@@ -69,6 +69,7 @@ export VLLM_ROCM_USE_AITER_LINEAR=1
+ export VLLM_ROCM_USE_AITER_RMSNORM=1
+ export VLLM_ROCM_USE_AITER_MOE=1
+ export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0
++
+ export AMDGCN_USE_BUFFER_OPS=0
+ export VLLM_DSV4_NUMERIC_CAP=65536
+ export VLLM_DSV4_AITER_SWIGLU_LIMIT=10.0
+@@ -78,8 +79,18 @@ export VLLM_DSV4_USE_AITER_TRITON_MLA_PREFILL=0
+ export VLLM_DSV4_USE_AITER_TRITON_MLA_DECODE=0
+ export VLLM_DSV4_USE_ATOM_TRITON_PREFILL_FP8=0
+ export VLLM_DSV4_USE_ATOM_TRITON_DECODE_FP8=1
+-export VLLM_DSV4_USE_ATOM_TRITON_PREFILL=1
++export VLLM_DSV4_USE_ATOM_TRITON_PREFILL=0
+ export VLLM_DSV4_USE_ATOM_TRITON_DECODE=0
++
++
++export VLLM_DSV4_USE_FLYDSL_DECODE_FP8=1
++export VLLM_BLOCK_TABLE_DELTA_COPY=1
++
++export VLLM_DSV4_AITER_TOPK_FAST=1
++export VLLM_DSV4_FLYDSL_COMPRESS=1
++export VLLM_DSV4_USE_ATOM_OPUS_PREFILL=1
++export VLLM_ROCM_FP8_BLOCKSCALE_PRESHUFFLE=1
++
+ export VLLM_DSV4_USE_FUSED_PAGED_MQA_LOGITS=1
+ 
+ export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+@@ -114,6 +125,7 @@ vllm serve ${MODEL} \
+     --tokenizer-mode "deepseek_v4" \
+     --seed 0 \
+     -cc.pass_config.fuse_norm_quant=True \
++    --speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":1}" \
+     --compilation-config="{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"cudagraph_capture_sizes\":[${max_num_seqs}],\"max_cudagraph_capture_size\":${max_num_seqs}}" \
+     ${PROFILER_ARGS:-} \
+     2>&1 | tee "${LOG}"
+-- 
+2.47.3
+
