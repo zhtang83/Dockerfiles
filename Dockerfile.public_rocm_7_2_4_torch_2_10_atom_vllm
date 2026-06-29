@@ -265,7 +265,15 @@ RUN pip install rocm-trace-lite && \
 # ATOM: Python package install (editable) with the atomesh build hook enabled.
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
-RUN git clone $ATOM_REPO /app/ATOM && \
+
+RUN --mount=type=bind,source=.,target=/tmp/home \
+    ls -l /tmp/home && \
+    mkdir -p /app/ATOM && \
+    tar -xzf /tmp/home/ATOM.tar.gz -C /app/ATOM --strip-components=1
+
+
+#RUN git clone $ATOM_REPO /app/ATOM && \
+RUN git config --global --add safe.directory /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ATOM_MESH_BUILD=0 python -m pip install -e .
@@ -306,12 +314,17 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     echo "Base image triton backed up: import_version=${BASE_TRITON_VERSION}" && \
     ls /tmp/triton-base-backup/
 
-RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
+RUN --mount=type=bind,source=.,target=/tmp/home \
+    echo "========== [OOT 3/7] Clone vLLM ==========" && \
     rm -rf /app/vllm && \
-    git clone "${VLLM_REPO}" /app/vllm && \
+    ls -l /tmp/home && \
+    mkdir -p /app/vllm && \
+    tar -xzf /tmp/home/vllm.tar.gz -C /app/vllm --strip-components=1 && \
+    git config --global --add safe.directory /app/vllm && \
+#    git clone "${VLLM_REPO}" /app/vllm && \
     cd /app/vllm && \
-    git checkout "${VLLM_COMMIT}" && \
-    git submodule update --init --recursive && \
+#    git checkout "${VLLM_COMMIT}" && \
+#    git submodule update --init --recursive && \
     echo "vLLM commit:" && \
     git rev-parse HEAD
 
