@@ -1,7 +1,7 @@
-From 054262ae8ae705d464d158434e69669860715398 Mon Sep 17 00:00:00 2001
+From 9dbd9128de2b7d03fb6bd3d9c86e932bd41d2be5 Mon Sep 17 00:00:00 2001
 From: Lyu Xudong <xudong.lyu@amd.com>
 Date: Sun, 28 Jun 2026 09:14:38 +0000
-Subject: [PATCH 1/2] fix(glm_moe_dsa): declare dense MLA metadata cudagraph
+Subject: [PATCH 2/3] fix(glm_moe_dsa): declare dense MLA metadata cudagraph
  support as UNIFORM_BATCH
 
 AiterMlaMetadataBuilderForVllm declared _cudagraph_support as

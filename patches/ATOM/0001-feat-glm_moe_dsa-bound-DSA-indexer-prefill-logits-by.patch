@@ -1,0 +1,108 @@
+From 02d5a76e5cee8ff113a0bc7e8b2e7f379c5102e0 Mon Sep 17 00:00:00 2001
+From: Lyu Xudong <xudong.lyu@amd.com>
+Date: Sun, 28 Jun 2026 09:07:28 +0000
+Subject: [PATCH 1/3] feat(glm_moe_dsa): bound DSA indexer prefill logits by
+ VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
+
+The DSA indexer prefill path materializes a single
+[num_tokens, total_seq_lens] float32 logits tensor inside fp8_mqa_logits.
+For long-context requests this can reach ~16 GiB in one allocation: a single
+large prefill request cannot be split across the per-request chunks, so its
+full logits matrix is built at once, which OOMs under tight memory budgets
+(e.g. alongside the FULL cudagraph memory pool).
+
+Sub-batch the query rows of each prefill chunk so every fp8_mqa_logits call
+stays under VLLM_SPARSE_INDEXER_MAX_LOGITS_MB (default 512). The gathered KV
+(k_fp8) is shared across sub-batches and cu_seqlen_ks/ke are KV-absolute
+offsets, so slicing query rows is correct. This mirrors vLLM upstream
+sparse_attn_indexer, which already chunks the logits by the same env var.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../plugin/vllm/attention/layer_sparse_mla.py | 62 +++++++++++--------
+ 1 file changed, 37 insertions(+), 25 deletions(-)
+
+diff --git a/atom/plugin/vllm/attention/layer_sparse_mla.py b/atom/plugin/vllm/attention/layer_sparse_mla.py
+index 5f02dae..6c2b227 100644
+--- a/atom/plugin/vllm/attention/layer_sparse_mla.py
++++ b/atom/plugin/vllm/attention/layer_sparse_mla.py
+@@ -337,6 +337,12 @@ def sparse_attn_indexer_plugin_mode(
+         )
+ 
+     if has_prefill:
++        import vllm.envs as _vllm_envs
++        # Bound the per-call fp8_mqa_logits allocation ([rows, total_seq_lens]
++        # float32) by VLLM_SPARSE_INDEXER_MAX_LOGITS_MB. A single large prefill
++        # request cannot be split across chunks, so sub-batch its query rows
++        # here; the gathered KV (k_fp8) is shared across sub-batches.
++        _max_logits_bytes = _vllm_envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+         prefill_metadata = indexer_meta.prefill
+         for chunk in prefill_metadata.chunks:
+             k_fp8 = torch.empty(
+@@ -359,32 +365,38 @@ def sparse_attn_indexer_plugin_mode(
+                 preshuffle=preshuffle_cache,
+             )
+ 
+-            logits = fp8_mqa_logits(
+-                Q=q_fp8[chunk.token_start : chunk.token_end],
+-                KV=k_fp8,
+-                kv_scales=k_scale,
+-                weights=weights[chunk.token_start : chunk.token_end],
+-                cu_starts=chunk.cu_seqlen_ks,
+-                cu_ends=chunk.cu_seqlen_ke,
+-            )
+-            num_rows = logits.shape[0]
+             assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
+-            topk_indices_prefill = topk_indices[
+-                chunk.token_start : chunk.token_end, :topk_tokens
+-            ]
+-            # Use top_k_per_row_prefill from vLLM to correctly handle row starts
+-            # and ends. It also produces 0-based local indices, eliminating the
+-            # need for conversion from global.
+-            torch.ops._C.top_k_per_row_prefill(
+-                logits,
+-                chunk.cu_seqlen_ks,
+-                chunk.cu_seqlen_ke,
+-                topk_indices_prefill,
+-                num_rows,
+-                logits.stride(0),
+-                logits.stride(1),
+-                topk_tokens,
+-            )
++            _chunk_ntok = int(chunk.token_end - chunk.token_start)
++            _kv_aligned = ((int(chunk.total_seq_lens) + 255) // 256) * 256
++            _bytes_per_row = max(1, _kv_aligned * 4)
++            _rows_per_batch = max(1, _max_logits_bytes // _bytes_per_row)
++            for _r0 in range(0, _chunk_ntok, _rows_per_batch):
++                _r1 = min(_r0 + _rows_per_batch, _chunk_ntok)
++                _t0 = chunk.token_start + _r0
++                _t1 = chunk.token_start + _r1
++                logits = fp8_mqa_logits(
++                    Q=q_fp8[_t0:_t1],
++                    KV=k_fp8,
++                    kv_scales=k_scale,
++                    weights=weights[_t0:_t1],
++                    cu_starts=chunk.cu_seqlen_ks[_r0:_r1],
++                    cu_ends=chunk.cu_seqlen_ke[_r0:_r1],
++                )
++                num_rows = logits.shape[0]
++                topk_indices_prefill = topk_indices[_t0:_t1, :topk_tokens]
++                # Use top_k_per_row_prefill from vLLM to correctly handle row
++                # starts and ends. It also produces 0-based local indices,
++                # eliminating the need for conversion from global.
++                torch.ops._C.top_k_per_row_prefill(
++                    logits,
++                    chunk.cu_seqlen_ks[_r0:_r1],
++                    chunk.cu_seqlen_ke[_r0:_r1],
++                    topk_indices_prefill,
++                    num_rows,
++                    logits.stride(0),
++                    logits.stride(1),
++                    topk_tokens,
++                )
+ 
+     if has_decode:
+         decode_metadata = indexer_meta.decode
+-- 
+2.47.3
+
