@@ -120,17 +120,17 @@ RUN echo "========== [Parallel] Building RCCL ==========" && \
 
 FROM build_rccl AS build_aiter
 
-ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="b5fceae834ab77e306297469cfa4ee13c8854ecd"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS=64
+ARG GFX_ARCH=gfx950
 
-#RUN pip install --upgrade setuptools_scm
+RUN --mount=type=bind,source=.,target=/tmp \
+    mkdir -p /app/aiter-test && \
+    tar -xzf /tmp/aiter.tar.gz -C /app/aiter-test --strip-components=1 && \
+    git config --global --add safe.directory /app/aiter-test
+
 RUN echo "========== [Parallel] Building Aiter ==========" && \
-    git clone $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
-    git checkout $AITER_COMMIT && \
-    git submodule sync && git submodule update --init --recursive && \
     pip install -r requirements.txt && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
     GPU_ARCHS=$GFX_ARCH python3 setup.py develop
