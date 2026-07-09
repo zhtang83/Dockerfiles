@@ -1,0 +1,536 @@
+#
+# Install basic packages from OS distro
+#
+FROM ubuntu:24.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN rm -f /etc/apt/apt.conf.d/docker-clean
+
+RUN --mount=target=/var/lib/apt/lists,type=cache,sharing=locked \
+    --mount=target=/var/cache/apt,type=cache,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl libnuma-dev gnupg wget git nano \
+        sudo libelf1 kmod file build-essential python3-dev \
+        software-properties-common sqlite3 libsqlite3-dev libfmt-dev \
+        libmsgpack-dev libsuitesparse-dev libdw-dev pkg-config libdrm-dev \
+        liblzma-dev libjpeg-dev libsox-dev libsox-fmt-all sox \
+        python3 python3-pip python3-dev python3-venv python3-lib2to3 python-is-python3
+
+RUN python3 -m venv /opt/python
+
+RUN wget -nv -O /tmp/cmake-3.26.4-linux-x86_64.tar.gz https://cmake.org/files/v3.26/cmake-3.26.4-linux-x86_64.tar.gz && \
+    tar zfx /tmp/cmake-3.26.4-linux-x86_64.tar.gz -C /opt/ && \
+    mv /opt/cmake-3.26.4-linux-x86_64 /opt/cmake-3.26.4 && \
+    rm -f /tmp/cmake-3.26.4-linux-x86_64.tar.gz
+
+ENV PATH=/opt/python/bin:/opt/cmake-3.26.4/bin:$PATH
+
+#
+# Install ROCm deb packages (7.2.4)
+#
+FROM base AS rocm_deb
+
+ARG ROCM_VERSION=7.2.4
+
+RUN --mount=target=/var/lib/apt/lists,type=cache,sharing=locked \
+    --mount=target=/var/cache/apt,type=cache,sharing=locked \
+    curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | apt-key add - && \
+    printf "deb [arch=amd64] https://repo.radeon.com/rocm/apt/$ROCM_VERSION/ jammy main" | tee /etc/apt/sources.list.d/rocm.list && \
+    printf "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n" > /etc/apt/preferences.d/artifactory-pin-600 && \
+    apt-get update && \
+    apt-get install -y rocm
+
+ENV ROCM_HOME=/opt/rocm
+ENV ROCM_PATH=/opt/rocm
+ENV CPLUS_INCLUDE_PATH=/opt/rocm/include:
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
+
+# Common Python build deps for the source-build stages (mirrors rocm_base)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U pip packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
+
+#
+# Triton build (source, mirrors docker/Dockerfile.rocm_base :: build_triton)
+#
+FROM rocm_deb AS build_triton
+
+ARG TRITON_BRANCH="0f380657"
+ARG TRITON_REPO="https://github.com/ROCm/triton.git"
+
+RUN git clone ${TRITON_REPO}
+# Cherry picking https://github.com/triton-lang/triton/pull/8991
+RUN cd triton \
+    && git checkout ${TRITON_BRANCH} \
+    && git config --global user.email "you@example.com" && git config --global user.name "Your Name" \
+    && git cherry-pick 555d04f \
+    && if [ ! -f setup.py ]; then cd python; fi \
+    && python3 setup.py bdist_wheel --dist-dir=dist \
+    && mkdir -p /app/install && cp dist/*.whl /app/install
+RUN if [ -d triton/python/triton_kernels ]; then pip install build && cd triton/python/triton_kernels \
+    && python3 -m build --wheel && cp dist/*.whl /app/install; fi
+
+#
+# PyTorch + vision + audio build (source, mirrors docker/Dockerfile.rocm_base :: build_pytorch)
+#
+FROM rocm_deb AS build_pytorch
+
+ARG PYTORCH_BRANCH="d0c8b1f3"
+ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
+ARG PYTORCH_VISION_BRANCH="v0.24.1"
+ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
+ARG PYTORCH_AUDIO_BRANCH="v2.9.0"
+ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
+ARG PYTORCH_ROCM_ARCH=gfx950
+ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
+
+RUN git clone ${PYTORCH_REPO} pytorch
+RUN cd pytorch && git checkout ${PYTORCH_BRANCH}
+RUN cd pytorch \
+    && pip install -r requirements.txt && git submodule update --init --recursive
+RUN cd pytorch && python3 tools/amd_build/build_amd.py \
+    && CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') python3 setup.py bdist_wheel --dist-dir=dist \
+    && pip install dist/*.whl
+RUN git clone ${PYTORCH_VISION_REPO} vision
+RUN cd vision && git checkout ${PYTORCH_VISION_BRANCH} \
+    && python3 setup.py bdist_wheel --dist-dir=dist \
+    && pip install dist/*.whl
+RUN git clone ${PYTORCH_AUDIO_REPO} audio
+RUN cd audio && git checkout ${PYTORCH_AUDIO_BRANCH} \
+    && git submodule update --init --recursive \
+    && pip install -r requirements.txt \
+    && python3 setup.py bdist_wheel --dist-dir=dist \
+    && pip install dist/*.whl
+RUN mkdir -p /app/install && cp /pytorch/dist/*.whl /app/install \
+    && cp /vision/dist/*.whl /app/install \
+    && cp /audio/dist/*.whl /app/install
+
+#
+# Assemble torch stack on the 7.2.4 rocm deb base.
+# torch/vision/audio/triton are the source-built wheels above; everything from
+# flash-attention onward follows the original Dockerfile.vllm_glm5_20260707.
+#
+FROM rocm_deb AS rocm_torch
+
+ARG GFX_ARCH="gfx950"
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U pip "setuptools<80" wheel && \
+    pip install numpy einops ninja && \
+    pip install /opt/rocm/share/amd_smi
+
+RUN --mount=type=bind,from=build_pytorch,source=/app/install,target=/tmp/torch_whl \
+    --mount=type=bind,from=build_triton,source=/app/install,target=/tmp/triton_whl \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install /tmp/torch_whl/*.whl /tmp/triton_whl/*.whl
+
+RUN python3 -c "import torch; print('torch', torch.__version__); import triton; print('triton', triton.__version__)"
+
+ENV PYTORCH_ROCM_ARCH=${GFX_ARCH}
+
+#
+# Build Flash Attention
+#
+FROM rocm_torch AS fa_build
+
+ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
+ARG FA_TAG="0e60e39"
+ARG GFX_ARCH=gfx950
+
+RUN git clone ${FA_REPO}
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install packaging psutil \
+ && cd flash-attention \
+ && git checkout ${FA_TAG} \
+ && git submodule init \
+ && git submodule update \
+ && GPU_ARCHS=${GFX_ARCH} BUILD_TARGET=rocm MAX_JOBS=$(nproc) python3 setup.py bdist_wheel \
+ && mkdir /install && cp dist/*.whl /install
+
+#
+# Install Flash Attention
+#
+FROM rocm_torch AS install_fa
+
+RUN --mount=type=bind,from=fa_build,source=/install,target=/tmp/install \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install /tmp/install/*.whl
+
+#
+# Build tilelang from source (pinned to vLLM's required 0.1.10) against THIS
+# image's real ROCm 7 headers, with the dlopen HIP stub DISABLED. The PyPI
+# tilelang wheel ships a libhip_stub.so built against ROCm 6 headers; under a
+# multi-process (TP>1) vLLM server its exported hipGetDevicePropertiesR0600
+# hijacks CK's symbol resolution and returns an empty gcnArchName, so aiter's
+# CK GEMM arch check fails ("This GEMM is not supported!"). Building here with
+# TILELANG_USE_HIP_STUBS=OFF links libamdhip64 directly (no stub, no hijack).
+# Produced as a wheel so the TVM/CMake build tree never lands in a shipped stage.
+#
+FROM rocm_torch AS build_tilelang
+
+ARG TILELANG_TAG="v0.1.10"
+ARG GFX_ARCH=gfx950
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "cython>=3.1.0" scikit-build-core "z3-solver>=4.13.0,<4.15.5" \
+        "patchelf>=0.17.2" build
+
+RUN git clone --recursive --branch ${TILELANG_TAG} \
+        https://github.com/tile-ai/tilelang.git /opt/tilelang
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /opt/tilelang && \
+    USE_ROCM=ON USE_CUDA=OFF \
+    CMAKE_ARGS="-DUSE_ROCM=ON -DUSE_CUDA=OFF -DTILELANG_USE_HIP_STUBS=OFF -DROCM_PATH=/opt/rocm" \
+    python3 -m build --wheel --no-isolation --outdir /install && \
+    ls /install/*.whl
+
+#
+# Fetch private aiter + vllm source using an SSH key mounted as a build secret.
+# The key is NEVER written to any image layer: it lives only in the ephemeral
+# tmpfs at /run/secrets during this RUN. Only /opt/aiter and /opt/vllm (source
+# checkouts) are carried forward by downstream stages via COPY --from=fetch_code.
+#
+FROM base AS fetch_code
+
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+ARG AITER_BRANCH="main"
+ARG VLLM_BRANCH="main"
+# Pin the checkout back to the exact commits used by the 7.14 baseline image so
+# the ONLY variable vs that baseline is the ROCm base (7.2.4 src), not vllm/aiter
+# source drift (the vllm-glm-52 branch HEAD moves over time).
+# Checkout the branch FIRST (creates the local vllm-glm-52 tracking branch so it
+# shows up in `git branch` for downstream development), THEN checkout the pinned
+# commit for the actual build.
+ARG AITER_COMMIT="2520c3da3de7ab3447907e7dc9d5a6c2d2eef657"
+ARG VLLM_COMMIT="1a308c449c93d25b11dc79a199ed67db185a18df"
+ARG COMMON_WORKDIR=/opt
+
+RUN --mount=target=/var/lib/apt/lists,type=cache,sharing=locked \
+    --mount=target=/var/cache/apt,type=cache,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends openssh-client
+
+WORKDIR ${COMMON_WORKDIR}
+
+RUN --mount=type=bind,source=.,target=/tmp \
+    ls -l /tmp && \
+    mkdir -p ${COMMON_WORKDIR}/patches && \
+    tar -xzf /tmp/patches.tar.gz -C ${COMMON_WORKDIR}/patches --strip-components=1
+
+RUN git clone ${AITER_REPO} ${COMMON_WORKDIR}/aiter && \
+    cd ${COMMON_WORKDIR}/aiter && \
+    git checkout ${AITER_BRANCH} && \
+    git checkout ${AITER_COMMIT} && \
+    git submodule update --init --recursive
+
+RUN git config user.name "Your Name" && \
+    git config user.email "your.email@example.com"
+
+RUN cd ${COMMON_WORKDIR}/aiter && for patch in ${COMMON_WORKDIR}/patches/aiter/*.patch; do \
+        if [ -f "$patch" ]; then \
+            echo "Applying patch: $patch"; \
+            git apply --check "$patch" || { echo "Check failed: $patch"; exit 1; }; \
+            git apply "$patch" || { echo "Apply failed: $patch"; exit 1; }; \
+        fi \
+    done
+
+RUN git clone ${VLLM_REPO} ${COMMON_WORKDIR}/vllm && \
+    cd ${COMMON_WORKDIR}/vllm && \
+    git checkout ${VLLM_BRANCH} && \
+    git checkout ${VLLM_COMMIT} && \
+    git submodule update --init --recursive
+
+RUN cd ${COMMON_WORKDIR}/vllm && for patch in ${COMMON_WORKDIR}/patches/vllm/*.patch; do \
+        if [ -f "$patch" ]; then \
+            echo "Applying patch: $patch"; \
+            git apply --check "$patch" || { echo "Check failed: $patch"; exit 1; }; \
+            git apply "$patch" || { echo "Apply failed: $patch"; exit 1; }; \
+        fi \
+    done
+
+#
+# vLLM + AITER build. Source is brought in ONLY via COPY --from=fetch_code, so
+# the entire surface for an SSH-key leak audit is confined to /opt/aiter and
+# /opt/vllm — check just those two directories.
+#
+FROM install_fa AS vllm_dev
+
+ARG GFX_ARCH=gfx950
+ARG COMMON_WORKDIR=/opt
+ARG BUILD_RPD="1"
+
+ENV AITER_USE_SYSTEM_TRITON=1
+
+WORKDIR ${COMMON_WORKDIR}
+
+COPY --from=fetch_code ${COMMON_WORKDIR}/aiter ${COMMON_WORKDIR}/aiter
+COPY --from=fetch_code ${COMMON_WORKDIR}/vllm ${COMMON_WORKDIR}/vllm
+
+RUN cd aiter \
+    && pip install -r requirements.txt
+
+RUN cd aiter && \
+    GPU_ARCHS=${GFX_ARCH} python3 setup.py develop && \
+    rm -rf /tmp/*
+
+ENV VLLM_INSTALL_PUNICA_KERNELS=1
+
+# The package name in ROCm 7.0.1 is 'triton', and in 7.0.0 and earlier is 'pytorch-triton'
+# So we need to create a fake package if 'triton' is not found, to satisfy pip requirement
+# during vLLM installation.
+RUN pip show triton > /dev/null 2>&1; \
+    if [ "$?" -ne 0 ] ; then \
+        cd $(pip show torch | grep Location | cut -d ' ' -f 2); \
+        mkdir triton-3.99.0.dist-info ; \
+        touch triton-3.99.0.dist-info/METADATA ; \
+    fi
+
+# Install our source-built tilelang wheel (real-ROCm7, no HIP stub) BEFORE the
+# vLLM requirements install. We keep the tilelang pin in requirements/rocm.txt:
+# our wheel is version 0.1.10+rocm.git... which satisfies the '==0.1.10' pin
+# (PEP 440 local version), so the later `pip install -r rocm.txt` treats it as
+# already-satisfied and does NOT pull the ABI-broken PyPI binary over it.
+# No import self-test here: tilelang import initializes TVM/HIP which aborts in
+# the GPU-less build environment. Wheel install is sufficient; it's exercised at
+# runtime. (Version is asserted by pip from the wheel filename.)
+RUN --mount=type=bind,from=build_tilelang,source=/install,target=/tmp/tl_whl \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install /tmp/tl_whl/*.whl
+
+# Build vLLM
+# Sometimes after vLLM installation, numpy is upgraded to 2.x but pandas is still at 2.0.3,
+# so manually upgrade pandas to avoid numpy mismatch in aiter JIT phase.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd vllm && \
+    sed -i '/^\s*gpt-oss .*/d' requirements/common.txt && \
+    sed -i '/triton/d' requirements/build/rocm.txt && \
+    sed -i '/torch/d' requirements/build/rocm.txt && \
+    sed -i '/amdsmi/d' requirements/build/rocm.txt && \
+    sed -i '/^\s*\"torch/d' pyproject.toml && \
+    sed -i 's/fastapi\[standard\] >= 0\.115\.0/fastapi[standard] >= 0.115.0,<0.137/' requirements/common.txt && \
+    pip install -U pandas && \
+    pip install -r requirements/build/rocm.txt && \
+    pip install -r requirements/rocm.txt && \
+    python3 -m pip install -v --no-build-isolation -e . && \
+    rm -rf /tmp/*
+
+# Guard: after the full vLLM install resolved all deps (incl. the tilelang pin),
+# assert our stub-free source-built tilelang is still the one installed — i.e.
+# the ABI-broken PyPI libhip_stub.so was NOT pulled in. Fail the build if found.
+RUN found="$(find / -name 'libhip_stub.so' 2>/dev/null)"; \
+    if [ -n "$found" ]; then \
+        echo "ERROR: libhip_stub.so present (PyPI tilelang leaked in):"; \
+        echo "$found"; \
+        exit 1; \
+    fi; \
+    python3 -c "import importlib.metadata as m; v=m.version('tilelang'); print('tilelang', v); assert '+rocm' in v, 'expected source-built +rocm tilelang, got '+v"
+
+RUN if [ ${BUILD_RPD} -eq "1" ]; then \
+    git clone -b nvtx_enabled https://github.com/ROCm/rocmProfileData.git \
+    && sed -i 's/pip install --user/pip install/' rocmProfileData/rocpd_python/Makefile \
+    && cd rocmProfileData/rpd_tracer \
+    && pip install -r requirements.txt && cd ../ \
+    && make && make install \
+    && cd hipMarker && python3 setup.py install ; fi
+
+#
+# AITER AOT JIT build
+#
+# The GLM5 aiter has no aiter/aot/aot.py, so we drop in the pinned upstream
+# aot.py (commit c751255) and patch it: the module list is set to exactly the
+# .so kernels GLM5 needs, and the module_moe_ck2stages branch enumerates its
+# concrete runtime variants via aiter's own get_moe_stage_module (stage1 =
+# mulWeightStage2+splitk, stage2 = mulWeightStage1) so AOT names match runtime.
+#
+FROM vllm_dev AS vllm_jit_build
+
+ARG COMMON_WORKDIR=/opt
+
+ENV GPU_ARCHS=gfx950
+
+COPY <<EOF /tmp/aot.patch
+@@ -13,6 +13,9 @@
+     get_args_of_build,
+     get_user_jit_dir,
+ )
++from aiter.ops.moe_op import get_moe_stage_module
++from aiter import dtypes
++from aiter import ActivationType, QuantType
+
+ root_dir = Path(__file__).resolve().parents[2]
+
+@@ -106,23 +109,30 @@
+
+     # Use provided modules or default set
+     modules_to_build = args.modules or [
+-        "module_mha_varlen_fwd",
+-        "module_quant",
+-        "module_rmsnorm",
+-        "module_rocsolgemm",
+-        "module_hipbsolgemm",
+-        "module_rope_general_fwd",
+-        "module_rope_pos_fwd",
+-        "module_moe_asm",
+-        "module_moe_sorting",
+-        "module_fused_moe_bf16_asm",
+-        "module_gemm_a8w8",
+-        "module_gemm_a8w8_bpreshuffle",
++        "module_activation",
++        "module_aiter_core",
+         "module_custom_all_reduce",
++        "module_deepgemm_opus",
++        "module_fused_qk_norm_rope_cache_quant_shuffle",
++        "module_gemm_a16w16_asm",
++        "module_gemm_a8w8_blockscale",
++        "module_gemm_a8w8_blockscale_bpreshuffle",
++        "module_gemm_a8w8_blockscale_bpreshuffle_asm",
++        "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
++        "module_gemm_a8w8_blockscale_bpreshuffle_cktile_tune",
++        "module_gemm_a8w8_blockscale_bpreshuffle_tune",
++        "module_gemm_a8w8_blockscale_cktile",
++        "module_gemm_common",
++        "module_mla_asm",
+         "module_mla_metadata",
+         "module_mla_reduce",
+-        "module_mla_asm",
+-        # "module_moe_ck2stages",
++        "module_moe_asm",
++        "module_moe_ck2stages",
++        "module_moe_fmoe_asm",
++        "module_moe_sorting_opus",
++        "module_quant",
++        "module_rmsnorm",
++        "module_rmsnorm_quant",
+     ]
+     print(f"modules_to_build: {modules_to_build}")
+     start_time = time.time()
+@@ -181,6 +191,15 @@
+                 "torch_exclude": build_args.get("torch_exclude", False),
+             }
+
++            # Current aiter's build_module requires these newer params;
++            # pull them through from get_args_of_build when present.
++            if "third_party" in build_module.__code__.co_varnames:
++                filtered_args["third_party"] = build_args.get("third_party", [])
++            if "flags_extra_hip_per_source" in build_module.__code__.co_varnames:
++                filtered_args["flags_extra_hip_per_source"] = build_args.get(
++                    "flags_extra_hip_per_source", None
++                )
++
+             if module_name == "module_mha_varlen_fwd":
+                 # Build runtime variants explicitly
+                 rt_module_names = [
+@@ -212,6 +231,41 @@
+                         variant_args["blob_gen_cmd"] = blob_gen_cmd
+                         if enable_parallel:
+                             submit_task(build_module, rt_module_name, **variant_args)
++                        else:
++                            build_module(rt_module_name, **variant_args)
++            elif module_name == "module_moe_ck2stages":
++                # ck2stages kernels are parameterized (dtype/quant/act/preshuffle/
++                # splitk); AOT must enumerate the concrete variants explicitly.
++                # md_name + blob_gen_cmd come straight from aiter's own
++                # get_moe_stage_module so they always match the runtime routing.
++                # GLM5 fmoe (a8w8 blockscale, fp8/fp8 -> bf16, silu, preshuffle
++                # off) uses stage1=mulWeightStage2+splitk and stage2=mulWeightStage1.
++                ck2stages_variants = [
++                    # (mul_routed_weight_stage, preshuffle_mode, is_splitk)
++                    # preshuffle_off pair: stage1=mrw2+splitk, stage2=mrw1
++                    (2, False, True),
++                    (1, False, False),
++                    # preshuffle_on stage2 (mrw2, no splitk) — observed JIT'd at
++                    # runtime during cudagraph capture; enumerate it for full AOT.
++                    (2, True, False),
++                ]
++                for mrw, preshuffle, is_splitk in ck2stages_variants:
++                    rt_module_name, blob_gen_cmd = get_moe_stage_module(
++                        dtypes.fp8,
++                        dtypes.fp8,
++                        dtypes.bf16,
++                        ActivationType.Silu,
++                        QuantType.per_128x128,
++                        mrw,
++                        preshuffle,
++                        is_splitk,
++                    )
++                    so_file = jit_dir / f"{rt_module_name}.so"
++                    if not so_file.exists() or args.force_rebuild:
++                        variant_args = filtered_args.copy()
++                        variant_args["blob_gen_cmd"] = blob_gen_cmd
++                        if enable_parallel:
++                            submit_task(build_module, rt_module_name, **variant_args)
+                         else:
+                             build_module(rt_module_name, **variant_args)
+             else:
+EOF
+
+RUN mkdir -p /${COMMON_WORKDIR}/aiter/aiter/aot && \
+    wget -O /${COMMON_WORKDIR}/aiter/aiter/aot/aot.py https://raw.githubusercontent.com/ROCm/aiter/c751255be974773f8f9f17e4ce6ba25ba9ca2404/aiter/aot/aot.py && \
+    patch /${COMMON_WORKDIR}/aiter/aiter/aot/aot.py < /tmp/aot.patch && \
+    rm -f /tmp/aot.patch
+
+# arch_info.py resolves the gfx arch at import time via the live triton driver,
+# which is unavailable in a GPU-less build. Make it honor GPU_ARCHS first so the
+# AOT step can import aiter without a GPU. This edit lives ONLY in this build
+# stage; the runtime image keeps the original (live-GPU) arch_info.py.
+COPY <<EOF /tmp/arch_info.patch
+--- arch_info.py.old	2026-04-30 11:10:36.553758957 +0800
++++ arch_info.py.new	2026-04-30 11:06:35.000000000 +0800
+@@ -1,11 +1,16 @@
++import os
+ import triton
+
+-try:
+-    _CACHED_ARCH = triton.runtime.driver.active.get_current_target().arch
+-except RuntimeError:
+-    from jax._src.lib import gpu_triton as triton_kernel_call_lib
++_env_arch = os.getenv("GPU_ARCHS")
++if _env_arch:
++    _CACHED_ARCH = _env_arch.split(";")[-1]
++else:
++    try:
++        _CACHED_ARCH = triton.runtime.driver.active.get_current_target().arch
++    except RuntimeError:
++        from jax._src.lib import gpu_triton as triton_kernel_call_lib
+
+-    _CACHED_ARCH = triton_kernel_call_lib.get_arch_details("0").split(":")[0]
++        _CACHED_ARCH = triton_kernel_call_lib.get_arch_details("0").split(":")[0]
+
+
+ def get_arch():
+EOF
+
+RUN patch /${COMMON_WORKDIR}/aiter/aiter/ops/triton/utils/_triton/arch_info.py < /tmp/arch_info.patch && \
+    rm -f /tmp/arch_info.patch
+
+RUN python3 -m aiter.aot.aot --enable-parallel && \
+    test -f /${COMMON_WORKDIR}/aiter/aiter/jit/module_gemm_common.so && \
+    test -f /${COMMON_WORKDIR}/aiter/aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_off_b16_silu_per_1x128_mulWeightStage2_splitk.so && \
+    test -f /${COMMON_WORKDIR}/aiter/aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_off_b16_silu_per_1x128_mulWeightStage1.so && \
+    test -f /${COMMON_WORKDIR}/aiter/aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_mulWeightStage2.so
+
+#
+# Install AITER JIT binaries
+#
+FROM vllm_dev AS vllm_jit
+
+ARG COMMON_WORKDIR=/opt
+
+COPY --from=vllm_jit_build /${COMMON_WORKDIR}/aiter/aiter/jit/*.so /${COMMON_WORKDIR}/aiter/aiter/jit/
+COPY --from=vllm_jit_build /${COMMON_WORKDIR}/aiter/aiter/aot/aot.py /${COMMON_WORKDIR}/aiter/aiter/aot/aot.py
+
+RUN cd $(pip show torch | grep Location | cut -d ' ' -f 2) && \
+    rm -rf triton-3.99.0.dist-info
+
+RUN --mount=type=bind,from=ubuntu:24.04,source=/,target=/tmp \
+    cp /tmp/etc/apt/apt.conf.d/docker-clean /etc/apt/apt.conf.d/docker-clean
+
+ENV DEBIAN_FRONTEND=
+
+WORKDIR /root
+
