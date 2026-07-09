@@ -45,7 +45,7 @@ RUN --mount=target=/var/lib/apt/lists,type=cache,sharing=locked \
 ENV ROCM_HOME=/opt/rocm
 ENV ROCM_PATH=/opt/rocm
 ENV CPLUS_INCLUDE_PATH=/opt/rocm/include:
-ENV LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:
 ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 
 # Common Python build deps for the source-build stages (mirrors rocm_base)
@@ -228,14 +228,13 @@ RUN git clone ${AITER_REPO} ${COMMON_WORKDIR}/aiter && \
     git checkout ${AITER_COMMIT} && \
     git submodule update --init --recursive
 
-RUN git config user.name "Your Name" && \
-    git config user.email "your.email@example.com"
+RUN git config --global user.email "you@example.com" && git config --global user.name "Your Name"
 
 RUN cd ${COMMON_WORKDIR}/aiter && for patch in ${COMMON_WORKDIR}/patches/aiter/*.patch; do \
         if [ -f "$patch" ]; then \
             echo "Applying patch: $patch"; \
             git apply --check "$patch" || { echo "Check failed: $patch"; exit 1; }; \
-            git apply "$patch" || { echo "Apply failed: $patch"; exit 1; }; \
+            git am "$patch" || { echo "Apply failed: $patch"; exit 1; }; \
         fi \
     done
 
@@ -249,7 +248,7 @@ RUN cd ${COMMON_WORKDIR}/vllm && for patch in ${COMMON_WORKDIR}/patches/vllm/*.p
         if [ -f "$patch" ]; then \
             echo "Applying patch: $patch"; \
             git apply --check "$patch" || { echo "Check failed: $patch"; exit 1; }; \
-            git apply "$patch" || { echo "Apply failed: $patch"; exit 1; }; \
+            git am "$patch" || { echo "Apply failed: $patch"; exit 1; }; \
         fi \
     done
 
