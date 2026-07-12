@@ -312,6 +312,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     sed -i '/triton/d' requirements/build/rocm.txt && \
     sed -i '/torch/d' requirements/build/rocm.txt && \
     sed -i '/amdsmi/d' requirements/build/rocm.txt && \
+    sed -i '/amd-quark/d' requirements/rocm.txt && \
     sed -i '/^\s*\"torch/d' pyproject.toml && \
     sed -i 's/fastapi\[standard\] >= 0\.115\.0/fastapi[standard] >= 0.115.0,<0.137/' requirements/common.txt && \
     pip install -U pandas && \
@@ -509,17 +510,7 @@ EOF
 RUN patch /${COMMON_WORKDIR}/aiter/aiter/ops/triton/utils/_triton/arch_info.py < /tmp/arch_info.patch && \
     rm -f /tmp/arch_info.patch
 
-# aiter/jit/core.py auto-deduplicates tuned CSV files on the first run and
-# then deliberately raises RuntimeError("Please re-run") with exit code 1.
-# The second run sees clean CSVs and performs the actual compilation.
-RUN python3 -m aiter.aot.aot 2>&1 | tee /tmp/aot_run1.log; \
-    if grep -q 'Please re-run' /tmp/aot_run1.log; then \
-        echo "=== CSV dedup done, re-running AOT ==="; \
-    else \
-        grep -q 'Total time:' /tmp/aot_run1.log || (cat /tmp/aot_run1.log && exit 1); \
-    fi
 RUN python3 -m aiter.aot.aot --enable-parallel && \
-    echo "=== AOT done, checking .so files ===" && \
     test -f /${COMMON_WORKDIR}/aiter/aiter/jit/module_gemm_common.so && \
     test -f /${COMMON_WORKDIR}/aiter/aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_off_b16_silu_per_1x128_mulWeightStage2_splitk.so && \
     test -f /${COMMON_WORKDIR}/aiter/aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_off_b16_silu_per_1x128_mulWeightStage1.so && \
