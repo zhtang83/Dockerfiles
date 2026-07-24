@@ -312,7 +312,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     sed -i '/triton/d' requirements/build/rocm.txt && \
     sed -i '/torch/d' requirements/build/rocm.txt && \
     sed -i '/amdsmi/d' requirements/build/rocm.txt && \
-    sed -i '/amd-quark/d' requirements/rocm.txt && \
     sed -i '/^\s*\"torch/d' pyproject.toml && \
     sed -i 's/fastapi\[standard\] >= 0\.115\.0/fastapi[standard] >= 0.115.0,<0.137/' requirements/common.txt && \
     pip install -U pandas && \
